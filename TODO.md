@@ -10,19 +10,23 @@
 
 ## Security
 
-### HIGH: `system()` calls enable shell injection
+### ✅ HIGH: `system()` calls enable shell injection — **FIXED in d37c398**
 
 **Problem:** `handle_key_press()` (i3lock.c:752-835) calls `system(cmd_brightness_up)` etc. with strings from CLI arguments. While the strings come from the user's own invocation, if i3lock is called from a script that interpolates untrusted data into these flags, it's a shell injection vector. `system()` also inherits environment and spawns a shell.
 
 **Fix:** Replace all `system()` calls with `fork()`+`execvp()` (split on spaces or use a simple tokenizer). This eliminates shell interpretation entirely. Alternatively, at minimum use `execl("/bin/sh", "sh", "-c", cmd, NULL)` in a forked child with a clean environment.
 
+**Applied:** Added `exec_cmd()` double-fork helper; all 14 `system()` calls replaced. Shell is still used (`sh -c`) for command string compatibility, but `system()` is gone.
+
 ---
 
-### HIGH: Debug mode prints password in plaintext
+### ✅ HIGH: Debug mode prints password in plaintext — **FIXED in a1bb7c0**
 
 **Problem:** i3lock.c:988 — `DEBUG("current password = %.*s\n", input_position, password);` outputs the password to stderr when `--debug` is used. If stderr is redirected to a file or journal, the password is logged.
 
 **Fix:** Remove this line entirely or replace with `DEBUG("password length = %d\n", input_position);`. A screen locker should never log credentials, even in debug mode.
+
+**Applied:** Line replaced with `DEBUG("password length = %d\n", input_position);`
 
 ---
 
@@ -34,27 +38,33 @@
 
 ---
 
-### MEDIUM: `--no-verify` flag bypasses all authentication
+### ✅ MEDIUM: `--no-verify` flag bypasses all authentication — **FIXED in a1bb7c0**
 
 **Problem:** i3lock.c:589 — `if (no_verify) { ev_break(...); return; }` unlocks immediately without any password check. This is dangerous if someone copies a lock script and forgets to remove the flag, or if a wrapper script has a bug.
 
 **Fix:** Print a prominent warning to stderr when `--no-verify` is active: `"WARNING: --no-verify is active, screen is NOT secured"`. Consider requiring `--debug` to be set simultaneously, or removing the feature entirely.
 
+**Applied:** Added `fprintf(stderr, "WARNING: --no-verify is set. Authentication is disabled!\n");`
+
 ---
 
-### MEDIUM: Slideshow path buffer overflow
+### ✅ MEDIUM: Slideshow path buffer overflow — **FIXED in a1bb7c0**
 
 **Problem:** `load_slideshow_images()` (i3lock.c:1720-1726) uses `char path_to_image[256]` and `strcpy`/`strcat` without bounds checking. If `path` (the directory) + `"/"` + `dir->d_name` exceeds 255 chars, stack buffer overflow occurs.
 
 **Fix:** Use `snprintf(path_to_image, sizeof(path_to_image), "%s/%s", path, dir->d_name)` and check for truncation, or use `asprintf()`.
 
+**Applied:** `char path_to_image[PATH_MAX]` with `snprintf`; truncation check skips overlong paths.
+
 ---
 
-### MEDIUM: `get_colorpixel()` alpha channel bug
+### ✅ MEDIUM: `get_colorpixel()` alpha channel bug — **FIXED in a1bb7c0**
 
 **Problem:** xcb.c:89 — `{hex[6], hex[4], '\0'}` should be `{hex[6], hex[7], '\0'}`. The alpha byte reads `hex[4]` (blue high nibble) instead of `hex[7]` (alpha low nibble). This means alpha is always wrong for the window background color.
 
 **Fix:** Change line 89 to `{hex[6], hex[7], '\0'}`.
+
+**Applied:** Off-by-one corrected.
 
 ---
 
@@ -76,7 +86,7 @@
 
 ## Performance
 
-### HIGH: Blur is O(σ²) — catastrophically slow at high sigma on 4K
+### ✅ HIGH: Blur is O(σ²) — catastrophically slow at high sigma on 4K — **FIXED in 76e52c5**
 
 **Problem:** The blur algorithm repeats a 7×7 box filter `n = σ²/4` times. At 4K (8.3M pixels) with σ=20, that's 100 iterations × 2 passes × 8.3M × 7 = ~11.6 billion operations. Takes 800ms+ on modern hardware.
 
@@ -94,13 +104,17 @@
 
 6. **AVX2 SIMD** — Process 8 pixels at a time instead of 4 (SSE2). 2× speedup.
 
+**Applied:** Implemented approach 2 (Kovesi 3-pass box blur). Three box radii computed from sigma; each pass is a horizontal + vertical sliding window in O(W×H). Total: O(W×H) regardless of sigma. SSE2 path removed as the sliding-window algorithm is already memory-bandwidth-bound.
+
 ---
 
-### HIGH: Expression re-compilation every frame
+### ✅ HIGH: Expression re-compilation every frame — **FIXED in 6a6e61a**
 
 **Problem:** `render_lock()` in unlock_indicator.c:1003-1024 calls `te_compile()` for ~20 expressions on every single frame redraw. Expression compilation involves parsing, AST allocation, etc. This is called on every keypress, every clock tick, every GIF frame.
 
 **Fix:** Compile expressions once at startup (after all options are parsed) and store them globally. They only reference variables by pointer, so they remain valid as long as the variable pointers don't change (they don't — they're stack variables in render_lock, but could be made static/global).
+
+**Applied:** 21 `te_expr*` pointers cached as file-scope statics. `te_compile()` called once on first `render_lock()` invocation (`te_exprs_compiled` flag). Variable values updated via 14 static backing doubles before each `te_eval()` block.
 
 ---
 
@@ -157,19 +171,23 @@
 
 ---
 
-### MEDIUM: Slideshow `load_image()` prototype mismatch
+### ✅ MEDIUM: Slideshow `load_image()` prototype mismatch — **FIXED in a1bb7c0**
 
 **Problem:** unlock_indicator.c:168 declares `cairo_surface_t* load_image(char* image_path);` but the actual function in i3lock.c:1651 has signature `cairo_surface_t *load_image(enum IMAGE_FORMAT format)`. This is undefined behavior.
 
 **Fix:** Update the declaration in unlock_indicator.c to match the actual signature, or refactor the slideshow code to use `verify_image()` + `load_image()` correctly.
 
+**Applied:** `load_image()` refactored to accept `const char *path`, auto-detecting format internally. All callers updated. Prototype in unlock_indicator.c matches.
+
 ---
 
-### MEDIUM: Xinerama fallback uses wrong variable
+### ✅ MEDIUM: Xinerama fallback uses wrong variable — **FIXED in a1bb7c0**
 
 **Problem:** randr.c:271 — `for (int screen = 0; screen < xr_screens; screen++)` uses `xr_screens` but this hasn't been updated yet (it's still from a previous query or 0). Should use the local `screens` variable.
 
 **Fix:** Change `screen < xr_screens` to `screen < screens`.
+
+**Applied:** `screen < xr_screens` → `screen < screens`.
 
 ---
 
@@ -181,19 +199,23 @@
 
 ---
 
-### LOW: GIF disposal mode bug
+### ✅ LOW: GIF disposal mode bug — **FIXED in a1bb7c0**
 
 **Problem:** i3lock.c:1246 — `data_size = width * height * ((int)sizeof(width))`. `sizeof(width)` is `sizeof(int)` which is 4 on most platforms, coincidentally correct for ARGB32. But this is fragile and wrong on platforms where int ≠ 4 bytes.
 
 **Fix:** Use `width * height * sizeof(uint32_t)` or `stride * height`.
 
+**Applied:** `sizeof(width)` → `sizeof(uint32_t)`.
+
 ---
 
-### LOW: GIF `memset` with color value
+### ✅ LOW: GIF `memset` with color value — **FIXED in a1bb7c0**
 
 **Problem:** i3lock.c:1256 — `memset(data, bg_color, data_size)` uses `memset` with a uint32_t color value. `memset` fills byte-by-byte, so only the lowest byte of `bg_color` is used. The background fill is incorrect for any color where the bytes aren't all the same.
 
 **Fix:** Use a loop: `for (int i = 0; i < width * height; i++) data[i] = bg_color;`
+
+**Applied:** Pixel-fill loop replacing `memset`.
 
 ---
 
