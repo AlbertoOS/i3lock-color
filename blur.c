@@ -29,6 +29,10 @@
 #include <cairo.h>
 #include "blur.h"
 
+#ifdef __x86_64__
+#include <immintrin.h>
+#endif
+
 /*
  * Computes three box-blur radii that approximate a Gaussian of standard
  * deviation @sigma via three sequential box-blur passes.
@@ -49,19 +53,17 @@ static void boxes_for_gauss(int sigma, int boxes[3]) {
 }
 
 /*
- * One box-blur pass: horizontal sliding window (src → scratch), then
- * vertical sliding window (scratch → dst).  Border pixels are clamped
- * (replicated edge).  All four ARGB channels are blurred independently.
- * Runs in O(W×H) time, independent of the box radius @r.
+ * Scalar horizontal box-blur pass: src → dst.
+ * Each row is processed with a sliding window of radius @r;
+ * border pixels are clamped (replicated edge).
  */
-static void box_blur_pass(uint32_t *src, uint32_t *dst, uint32_t *scratch,
-                           int w, int h, int r) {
+static void box_blur_hpass_scalar(uint32_t *src, uint32_t *dst,
+                                   int w, int h, int r) {
     int diam = 2 * r + 1;
 
-    /* Horizontal pass: src → scratch */
     for (int y = 0; y < h; y++) {
         uint32_t *row_src = src + (ptrdiff_t)y * w;
-        uint32_t *row_out = scratch + (ptrdiff_t)y * w;
+        uint32_t *row_out = dst + (ptrdiff_t)y * w;
         uint32_t aa = 0, ra = 0, ga = 0, ba = 0;
 
         /* Prime the sliding window with r clamped-left pixels + pixel [0] */
@@ -92,15 +94,84 @@ static void box_blur_pass(uint32_t *src, uint32_t *dst, uint32_t *scratch,
             ba += (p_in & 0xFF) - (p_out & 0xFF);
         }
     }
+}
 
-    /* Vertical pass: scratch → dst */
+/*
+ * SSE2 vectorized horizontal box-blur pass: src → dst.
+ * Processes one pixel at a time using SSE2 to parallelize the
+ * four-channel (ARGB) accumulate / divide / pack.
+ */
+#ifdef __x86_64__
+__attribute__((target("sse2"))) static void
+box_blur_hpass_sse2(uint32_t *src, uint32_t *dst, int w, int h, int r) {
+    int diam = 2 * r + 1;
+    __m128 diam_vec = _mm_set1_ps((float)diam);
+    __m128i zero = _mm_setzero_si128();
+
+    for (int y = 0; y < h; y++) {
+        uint32_t *row_src = src + (ptrdiff_t)y * w;
+        uint32_t *row_out = dst + (ptrdiff_t)y * w;
+
+        /* Prime the sliding window with scalar accumulation */
+        __m128i acc = _mm_setzero_si128();
+        for (int x = -r; x <= r; x++) {
+            int sx = x < 0 ? 0 : (x >= w ? w - 1 : x);
+            uint32_t p = row_src[sx];
+            __m128i pv = _mm_cvtsi32_si128((int)p);
+            __m128i unpacked = _mm_unpacklo_epi8(pv, zero);
+            unpacked = _mm_unpacklo_epi16(unpacked, zero);
+            acc = _mm_add_epi32(acc, unpacked);
+        }
+
+        for (int x = 0; x < w; x++) {
+            /* Divide accumulator by diameter via float conversion */
+            __m128 f = _mm_cvtepi32_ps(acc);
+            f = _mm_div_ps(f, diam_vec);
+            __m128i result = _mm_cvttps_epi32(f);
+
+            /* Pack back to a single ARGB uint32 */
+            result = _mm_packs_epi32(result, zero);
+            result = _mm_packus_epi16(result, zero);
+            row_out[x] = (uint32_t)_mm_cvtsi128_si32(result);
+
+            /* Slide window: subtract outgoing, add incoming */
+            int out_x = x - r;
+            int in_x = x + r + 1;
+            int sx_out = out_x < 0 ? 0 : (out_x >= w ? w - 1 : out_x);
+            int sx_in = in_x < 0 ? 0 : (in_x >= w ? w - 1 : in_x);
+            uint32_t p_out = row_src[sx_out];
+            uint32_t p_in = row_src[sx_in];
+
+            __m128i pv_out = _mm_cvtsi32_si128((int)p_out);
+            __m128i unpacked_out = _mm_unpacklo_epi8(pv_out, zero);
+            unpacked_out = _mm_unpacklo_epi16(unpacked_out, zero);
+
+            __m128i pv_in = _mm_cvtsi32_si128((int)p_in);
+            __m128i unpacked_in = _mm_unpacklo_epi8(pv_in, zero);
+            unpacked_in = _mm_unpacklo_epi16(unpacked_in, zero);
+
+            acc = _mm_sub_epi32(acc, unpacked_out);
+            acc = _mm_add_epi32(acc, unpacked_in);
+        }
+    }
+}
+#endif /* __x86_64__ */
+
+/*
+ * Vertical box-blur pass: scratch → dst.
+ * Each column is processed with a sliding window of radius @r.
+ */
+static void box_blur_vpass(uint32_t *src, uint32_t *dst,
+                            int w, int h, int r) {
+    int diam = 2 * r + 1;
+
     for (int x = 0; x < w; x++) {
         uint32_t aa = 0, ra = 0, ga = 0, ba = 0;
 
         /* Prime the window */
         for (int y = -r; y <= r; y++) {
             int sy = y < 0 ? 0 : (y >= h ? h - 1 : y);
-            uint32_t p = scratch[(ptrdiff_t)sy * w + x];
+            uint32_t p = src[(ptrdiff_t)sy * w + x];
             aa += (p >> 24) & 0xFF;
             ra += (p >> 16) & 0xFF;
             ga += (p >> 8) & 0xFF;
@@ -117,14 +188,29 @@ static void box_blur_pass(uint32_t *src, uint32_t *dst, uint32_t *scratch,
             int in_y = y + r + 1;
             int sy_out = out_y < 0 ? 0 : (out_y >= h ? h - 1 : out_y);
             int sy_in = in_y < 0 ? 0 : (in_y >= h ? h - 1 : in_y);
-            uint32_t p_out = scratch[(ptrdiff_t)sy_out * w + x];
-            uint32_t p_in = scratch[(ptrdiff_t)sy_in * w + x];
+            uint32_t p_out = src[(ptrdiff_t)sy_out * w + x];
+            uint32_t p_in = src[(ptrdiff_t)sy_in * w + x];
             aa += ((p_in >> 24) & 0xFF) - ((p_out >> 24) & 0xFF);
             ra += ((p_in >> 16) & 0xFF) - ((p_out >> 16) & 0xFF);
             ga += ((p_in >> 8) & 0xFF) - ((p_out >> 8) & 0xFF);
             ba += (p_in & 0xFF) - (p_out & 0xFF);
         }
     }
+}
+
+/*
+ * One box-blur pass: horizontal sliding window (src → scratch), then
+ * vertical sliding window (scratch → dst).  Border pixels are clamped
+ * (replicated edge).  All four ARGB channels are blurred independently.
+ * Runs in O(W×H) time, independent of the box radius @r.
+ *
+ * This is the scalar-only path; SSE2 callers should use the split
+ * hpass/vpass functions directly.
+ */
+static void box_blur_pass(uint32_t *src, uint32_t *dst, uint32_t *scratch,
+                            int w, int h, int r) {
+    box_blur_hpass_scalar(src, scratch, w, h, r);
+    box_blur_vpass(scratch, dst, w, h, r);
 }
 
 /*
@@ -145,15 +231,37 @@ static void do_blur(uint32_t *data, int w, int h, int sigma) {
     boxes_for_gauss(sigma, boxes);
 
     /*
+     * Choose SSE2 or scalar horizontal pass at runtime.
+     * SSE2 is baseline on x86_64; on other archs we fall back to scalar.
+     */
+#ifdef __x86_64__
+    /* SSE2 is baseline on x86_64, always available */
+    static bool use_sse2 = true;
+#else
+    static bool use_sse2 = false;
+#endif
+
+    /*
      * Three ping-pong passes between data (buf0) and buf1:
      *   pass 0: data → buf1  (via scratch)
      *   pass 1: buf1 → data  (via scratch)
      *   pass 2: data → buf1  (via scratch)
      * Final result lands in buf1; copy back to data.
      */
-    box_blur_pass(data, buf1, scratch, w, h, boxes[0]);
-    box_blur_pass(buf1, data, scratch, w, h, boxes[1]);
-    box_blur_pass(data, buf1, scratch, w, h, boxes[2]);
+    if (use_sse2) {
+#ifdef __x86_64__
+        box_blur_hpass_sse2(data, scratch, w, h, boxes[0]);
+        box_blur_vpass(scratch, buf1, w, h, boxes[0]);
+        box_blur_hpass_sse2(buf1, scratch, w, h, boxes[1]);
+        box_blur_vpass(scratch, data, w, h, boxes[1]);
+        box_blur_hpass_sse2(data, scratch, w, h, boxes[2]);
+        box_blur_vpass(scratch, buf1, w, h, boxes[2]);
+#endif
+    } else {
+        box_blur_pass(data, buf1, scratch, w, h, boxes[0]);
+        box_blur_pass(buf1, data, scratch, w, h, boxes[1]);
+        box_blur_pass(data, buf1, scratch, w, h, boxes[2]);
+    }
     memcpy(data, buf1, (size_t)w * h * sizeof(uint32_t));
 
     free(buf1);
