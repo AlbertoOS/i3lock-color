@@ -163,11 +163,11 @@
 
 ## Correctness
 
-### MEDIUM: Thread safety of `redraw_screen()`
+### ✅ MEDIUM: Thread safety of `redraw_screen()` — **FIXED in 8123f78**
 
 **Problem:** When `--redraw-thread` is active, `start_time_redraw_tick_pthread()` calls `redraw_screen()` from a separate thread while the main thread may also call it (on key events, auth state changes, etc.). `redraw_screen()` uses the global XCB connection and modifies shared state (`bar_heights`, draw data). No mutex exists.
 
-**Fix:** Add a mutex around `redraw_screen()`, or better, have the redraw thread just set a flag that the main loop checks, ensuring all rendering happens on the main thread.
+**Fix:** Added a `PTHREAD_MUTEX_RECURSIVE` mutex initialized via `pthread_once` inside `redraw_screen()`. Recursive type prevents deadlock from `clear_indicator() → redraw_screen()` re-entry on the same thread. All XCB pixmap operations are now serialized.
 
 ---
 
