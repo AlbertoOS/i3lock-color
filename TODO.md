@@ -118,14 +118,15 @@
 
 ---
 
-### MEDIUM: Full-screen redraw on every keypress
+### ✅ MEDIUM: Full-screen redraw on every keypress — **FIXED in perf commits + partial redraw**
 
 **Problem:** `redraw_screen()` creates a new pixmap, renders the entire screen (background + image + all indicators + all text), blits it, and frees it. On 4K, that's allocating and filling a 33MB buffer per keypress.
 
-**Fix:** 
-1. Cache the background (color/blur/image) in a persistent pixmap — it never changes after startup
-2. Only redraw the indicator region (bounding box around the circle/bar)
-3. Use `xcb_copy_area` to restore the cached background in the dirty region before redrawing the indicator
+**Fix applied:**
+1. Background cached in `bg_cache` surface — never re-rendered after startup
+2. Persistent server-side pixmap (`persistent_pixmap`) reused across frames — no alloc/free per keypress
+3. `redraw_needed` dirty flag + coalesced redraw in `xcb_check_cb` — burst typing triggers one redraw
+4. Partial redraw path (`REDRAW_PARTIAL`): on keypress, only the indicator bounding box is restored from `bg_only_pixmap` and redrawn — ~200×200px instead of full 4K frame
 
 ---
 
@@ -163,11 +164,13 @@
 
 ## Correctness
 
-### ✅ MEDIUM: Thread safety of `redraw_screen()` — **FIXED in 8123f78**
+### ✅ MEDIUM: Thread safety of `redraw_screen()` — **FIXED in 8123f78 + condvar render thread**
 
 **Problem:** When `--redraw-thread` is active, `start_time_redraw_tick_pthread()` calls `redraw_screen()` from a separate thread while the main thread may also call it (on key events, auth state changes, etc.). `redraw_screen()` uses the global XCB connection and modifies shared state (`bar_heights`, draw data). No mutex exists.
 
 **Fix:** Added a `PTHREAD_MUTEX_RECURSIVE` mutex initialized via `pthread_once` inside `redraw_screen()`. Recursive type prevents deadlock from `clear_indicator() → redraw_screen()` re-entry on the same thread. All XCB pixmap operations are now serialized.
+
+**Further improved:** `--redraw-thread` now uses a proper condvar-based render thread. Main event loop signals the condvar instead of calling `redraw_screen()` directly — rendering is fully decoupled from event processing. `time_redraw_cb` (clock/slideshow ticks) also signals the condvar when `--redraw-thread` is active.
 
 ---
 
@@ -257,7 +260,9 @@
 
 - [ ] Wayland support (or at least a clear "use swaylock" message — already done)
 - [ ] Config file support (instead of 100+ CLI flags)
-- [ ] Proper dirty-region rendering (only redraw indicator area)
+- [x] Proper dirty-region rendering (only redraw indicator area) — **done: partial redraws + persistent pixmap**
+- [x] `--redraw-thread` condvar decoupling — **done: render thread fully decoupled from event loop**
+- [x] `--ind-blur-radius N` frosted-glass circle behind indicator — **done: blurs bg_cache region, clips to circle, composites before ring draw**
 - [ ] GPU-accelerated blur (OpenGL/Vulkan compute shader)
 - [ ] Password length indicator (dots) option
 - [ ] Accessibility: screen reader support, high-contrast mode

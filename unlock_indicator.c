@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 #include <xcb/xcb.h>
 #include <xcb/randr.h>
 #include <ev.h>
@@ -26,6 +27,7 @@
 #include "dpi.h"
 #include "tinyexpr.h"
 #include "fonts.h"
+#include "blur.h"
 
 /* clock stuff */
 #include <time.h>
@@ -215,6 +217,13 @@ extern bool show_failed_attempts;
 extern int failed_attempts;
 /* Whether password verification is disabled (--no-verify). */
 extern bool no_verify;
+/* Whether --redraw-thread is active. */
+extern bool redraw_thread;
+extern pthread_mutex_t render_cond_mutex;
+extern pthread_cond_t  render_cond;
+extern volatile bool   render_pending;
+/* Indicator blur radius (--ind-blur-radius). */
+extern int ind_blur_radius;
 
 /*******************************************************************************
  * Variables defined in xcb.c.
@@ -246,6 +255,18 @@ int current_slideshow_index = 0;
 static cairo_surface_t *bg_cache = NULL;
 static uint32_t bg_cache_w = 0, bg_cache_h = 0;
 static int bg_cache_slideshow_idx = -1;
+
+/* Persistent pixmap for redraw avoidance (Feature 2) */
+static xcb_pixmap_t persistent_pixmap = XCB_NONE;
+static uint32_t persistent_pix_w = 0, persistent_pix_h = 0;
+static xcb_pixmap_t bg_only_pixmap = XCB_NONE;
+static uint32_t bg_only_w = 0, bg_only_h = 0;
+static xcb_gcontext_t copy_gc = XCB_NONE;
+static double last_ind_x = 0, last_ind_y = 0;
+redraw_mode_t pending_redraw_mode = REDRAW_FULL;
+
+static xcb_gcontext_t get_copy_gc(void);
+static void partial_redraw_indicator(void);
 
 /*
  * Invalidate the background cache.  Called from handle_screen_resize() (in
@@ -1248,6 +1269,49 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
             DEBUG("Status at %fx%f on screen %d\n", draw_data.status_text.x, draw_data.status_text.y, current_screen + 1);
             DEBUG("Mod at %fx%f on screen %d\n", draw_data.mod_text.x, draw_data.mod_text.y, current_screen + 1);
             // scale_draw_data(&draw_data, scaling_factor);
+
+            last_ind_x = draw_data.indicator_x;
+            last_ind_y = draw_data.indicator_y;
+
+            /* Frosted-glass blur behind indicator (multi-monitor) */
+            if (ind_blur_radius > 0 && bg_cache != NULL) {
+                double blur_r = (circle_radius + (double)ind_blur_radius) * scaling_factor;
+                double cx = draw_data.indicator_x * scaling_factor;
+                double cy = draw_data.indicator_y * scaling_factor;
+
+                int src_x = (int)(cx - blur_r);
+                int src_y = (int)(cy - blur_r);
+                int src_size = (int)(2.0 * blur_r);
+                int cache_w = cairo_image_surface_get_width(bg_cache);
+                int cache_h = cairo_image_surface_get_height(bg_cache);
+
+                if (src_x < 0) src_x = 0;
+                if (src_y < 0) src_y = 0;
+                if (src_x + src_size > cache_w) src_size = cache_w - src_x;
+                if (src_y + src_size > cache_h) src_size = cache_h - src_y;
+
+                if (src_size > 0) {
+                    cairo_surface_t *tmp_surf = cairo_image_surface_create(
+                        CAIRO_FORMAT_ARGB32, src_size, src_size);
+                    cairo_t *tmp_cr = cairo_create(tmp_surf);
+                    cairo_set_source_surface(tmp_cr, bg_cache, -src_x, -src_y);
+                    cairo_paint(tmp_cr);
+                    cairo_destroy(tmp_cr);
+
+                    blur_image_surface(tmp_surf, ind_blur_radius, 1);
+
+                    cairo_save(ctx);
+                    cairo_identity_matrix(ctx);
+                    cairo_arc(ctx, cx, cy, blur_r, 0, 2 * M_PI);
+                    cairo_clip(ctx);
+                    cairo_set_source_surface(ctx, tmp_surf, src_x, src_y);
+                    cairo_paint(ctx);
+                    cairo_restore(ctx);
+
+                    cairo_surface_destroy(tmp_surf);
+                }
+            }
+
             draw_elements(ctx, &draw_data);
         }
     } else {
@@ -1332,6 +1396,68 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         DEBUG("Layout at %fx%f\n", draw_data.keylayout_text.x, draw_data.keylayout_text.y);
         DEBUG("Status at %fx%f\n", draw_data.status_text.x, draw_data.status_text.y);
         DEBUG("Mod at %fx%f\n", draw_data.mod_text.x, draw_data.mod_text.y);
+
+        /* Snapshot background-only state for partial redraws */
+        cairo_surface_flush(xcb_output);
+        if (bg_only_pixmap == XCB_NONE ||
+            bg_only_w != resolution[0] || bg_only_h != resolution[1]) {
+            if (bg_only_pixmap != XCB_NONE)
+                xcb_free_pixmap(conn, bg_only_pixmap);
+            bg_only_pixmap = xcb_generate_id(conn);
+            xcb_create_pixmap(conn, 32, bg_only_pixmap, win, resolution[0], resolution[1]);
+            bg_only_w = resolution[0];
+            bg_only_h = resolution[1];
+            /* Invalidate copy_gc since pixmap changed */
+            if (copy_gc != XCB_NONE) {
+                xcb_free_gc(conn, copy_gc);
+                copy_gc = XCB_NONE;
+            }
+        }
+        xcb_copy_area(conn, drawable, bg_only_pixmap, get_copy_gc(),
+                      0, 0, 0, 0, resolution[0], resolution[1]);
+
+        last_ind_x = draw_data.indicator_x;
+        last_ind_y = draw_data.indicator_y;
+
+        /* Frosted-glass blur behind indicator */
+        if (ind_blur_radius > 0 && bg_cache != NULL) {
+            double blur_r = (circle_radius + (double)ind_blur_radius) * scaling_factor;
+            double cx = draw_data.indicator_x * scaling_factor;
+            double cy = draw_data.indicator_y * scaling_factor;
+
+            int src_x = (int)(cx - blur_r);
+            int src_y = (int)(cy - blur_r);
+            int src_size = (int)(2.0 * blur_r);
+            int cache_w = cairo_image_surface_get_width(bg_cache);
+            int cache_h = cairo_image_surface_get_height(bg_cache);
+
+            if (src_x < 0) src_x = 0;
+            if (src_y < 0) src_y = 0;
+            if (src_x + src_size > cache_w) src_size = cache_w - src_x;
+            if (src_y + src_size > cache_h) src_size = cache_h - src_y;
+
+            if (src_size > 0) {
+                cairo_surface_t *tmp_surf = cairo_image_surface_create(
+                    CAIRO_FORMAT_ARGB32, src_size, src_size);
+                cairo_t *tmp_cr = cairo_create(tmp_surf);
+                cairo_set_source_surface(tmp_cr, bg_cache, -src_x, -src_y);
+                cairo_paint(tmp_cr);
+                cairo_destroy(tmp_cr);
+
+                blur_image_surface(tmp_surf, ind_blur_radius, 1);
+
+                /* Composite blurred region back, clipped to circle */
+                cairo_save(ctx);
+                cairo_identity_matrix(ctx);
+                cairo_arc(ctx, cx, cy, blur_r, 0, 2 * M_PI);
+                cairo_clip(ctx);
+                cairo_set_source_surface(ctx, tmp_surf, src_x, src_y);
+                cairo_paint(ctx);
+                cairo_restore(ctx);
+
+                cairo_surface_destroy(tmp_surf);
+            }
+        }
 
         draw_elements(ctx, &draw_data);
     }
@@ -1423,8 +1549,50 @@ static void init_redraw_mutex(void) {
  * Calls render_lock on a new pixmap and swaps that with the current pixmap
  *
  */
-static xcb_pixmap_t persistent_pixmap = XCB_NONE;
-static uint32_t persistent_pix_w = 0, persistent_pix_h = 0;
+
+static xcb_gcontext_t get_copy_gc(void) {
+    if (copy_gc == XCB_NONE && persistent_pixmap != XCB_NONE) {
+        copy_gc = xcb_generate_id(conn);
+        xcb_create_gc(conn, copy_gc, persistent_pixmap, 0, NULL);
+    }
+    return copy_gc;
+}
+
+static void partial_redraw_indicator(void) {
+    if (bg_only_pixmap == XCB_NONE || persistent_pixmap == XCB_NONE)
+        return;
+
+    const double scaling_factor = get_dpi_value() / 96.0;
+    int px = (int)(last_ind_x * scaling_factor);
+    int py = (int)(last_ind_y * scaling_factor);
+    int radius = (int)((circle_radius + ring_width / 2.0 + 10.0) * scaling_factor);
+
+    int x0 = px - radius; if (x0 < 0) x0 = 0;
+    int y0 = py - radius; if (y0 < 0) y0 = 0;
+    int x1 = px + radius; if (x1 > (int)last_resolution[0]) x1 = (int)last_resolution[0];
+    int y1 = py + radius; if (y1 > (int)last_resolution[1]) y1 = (int)last_resolution[1];
+    int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0) return;
+
+    /* Restore background region */
+    xcb_copy_area(conn, bg_only_pixmap, persistent_pixmap, get_copy_gc(),
+                  x0, y0, x0, y0, w, h);
+
+    /* Redraw indicator on top */
+    xcb_visualtype_t *vt = get_visualtype_by_depth(32, screen);
+    cairo_surface_t *surf = cairo_xcb_surface_create(
+        conn, persistent_pixmap, vt, last_resolution[0], last_resolution[1]);
+    cairo_t *cr = cairo_create(surf);
+    cairo_scale(cr, scaling_factor, scaling_factor);
+    draw_indic(cr, last_ind_x, last_ind_y);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+
+    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP,
+                                 (uint32_t[1]){persistent_pixmap});
+    xcb_clear_area(conn, 0, win, x0, y0, w, h);
+    xcb_flush(conn);
+}
 
 void redraw_screen(void) {
     pthread_once(&redraw_mutex_once, init_redraw_mutex);
@@ -1440,12 +1608,25 @@ void redraw_screen(void) {
         persistent_pixmap = create_bg_pixmap(conn, win, last_resolution, color);
         persistent_pix_w = last_resolution[0];
         persistent_pix_h = last_resolution[1];
+        pending_redraw_mode = REDRAW_FULL;
+        if (bg_only_pixmap != XCB_NONE) {
+            xcb_free_pixmap(conn, bg_only_pixmap);
+            bg_only_pixmap = XCB_NONE;
+        }
+    }
+
+    if (pending_redraw_mode == REDRAW_PARTIAL && bg_only_pixmap != XCB_NONE) {
+        partial_redraw_indicator();
+        pending_redraw_mode = REDRAW_FULL;
+        pthread_mutex_unlock(&redraw_mutex);
+        return;
     }
 
     render_lock(last_resolution, persistent_pixmap);
     xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[1]){persistent_pixmap});
     xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
     xcb_flush(conn);
+    pending_redraw_mode = REDRAW_FULL;
     pthread_mutex_unlock(&redraw_mutex);
 }
 
@@ -1472,7 +1653,14 @@ void *start_time_redraw_tick_pthread(void *arg) {
 }
 
 static void time_redraw_cb(struct ev_loop *loop, ev_periodic *w, int revents) {
-    redraw_screen();
+    if (redraw_thread) {
+        pthread_mutex_lock(&render_cond_mutex);
+        render_pending = true;
+        pthread_cond_signal(&render_cond);
+        pthread_mutex_unlock(&render_cond_mutex);
+    } else {
+        redraw_screen();
+    }
 }
 
 void start_time_redraw_tick(struct ev_loop *main_loop) {

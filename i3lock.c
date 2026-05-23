@@ -210,6 +210,7 @@ bool blur = false;
 bool step_blur = false;
 int blur_sigma = 5;
 static int blur_scale = 1;
+int ind_blur_radius = 0;
 
 /* do not verify password */
 bool no_verify = false;
@@ -305,6 +306,13 @@ pthread_t draw_thread;
 // allow you to disable. handy if you use bar with lots of crap.
 bool redraw_thread = false;
 static bool redraw_needed = false;
+extern redraw_mode_t pending_redraw_mode;
+
+/* Condvar-based render thread (--redraw-thread) */
+pthread_mutex_t render_cond_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  render_cond       = PTHREAD_COND_INITIALIZER;
+volatile bool   render_pending    = false;
+volatile bool   render_shutdown   = false;
 
 // experimental bar stuff
 #define BAR_VERT 0
@@ -699,6 +707,34 @@ static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
     STOP_TIMER(w);
 }
 
+static void *render_thread_func(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&render_cond_mutex);
+    while (!render_shutdown) {
+        while (!render_pending && !render_shutdown)
+            pthread_cond_wait(&render_cond, &render_cond_mutex);
+        if (render_shutdown)
+            break;
+        render_pending = false;
+        pthread_mutex_unlock(&render_cond_mutex);
+        redraw_screen();
+        pthread_mutex_lock(&render_cond_mutex);
+    }
+    pthread_mutex_unlock(&render_cond_mutex);
+    return NULL;
+}
+
+static void request_redraw(void) {
+    if (redraw_thread) {
+        pthread_mutex_lock(&render_cond_mutex);
+        render_pending = true;
+        pthread_cond_signal(&render_cond);
+        pthread_mutex_unlock(&render_cond_mutex);
+    } else {
+        redraw_screen();
+    }
+}
+
 static bool skip_without_validation(void) {
     if (input_position != 0)
         return false;
@@ -1001,6 +1037,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
             unlock_state = STATE_BACKSPACE_ACTIVE;
             redraw_needed = true;
+            pending_redraw_mode = REDRAW_PARTIAL;
             return;
     }
 
@@ -1029,6 +1066,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     if (unlock_indicator) {
         unlock_state = STATE_KEY_ACTIVE;
         redraw_needed = true;
+        pending_redraw_mode = REDRAW_PARTIAL;
 
         struct ev_timer *timeout = NULL;
         START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
@@ -1636,7 +1674,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
      * Typing 5 keys in 20ms triggers 1 redraw instead of 5. */
     if (redraw_needed) {
         redraw_needed = false;
-        redraw_screen();
+        request_redraw();
     }
 }
 
@@ -1861,6 +1899,7 @@ int main(int argc, char *argv[]) {
         {"screen", required_argument, NULL, 'S'},
         {"blur", required_argument, NULL, 'B'},
         {"blur-scale", required_argument, NULL, 906},
+        {"ind-blur-radius", required_argument, NULL, 907},
 
         // options for unlock indicator colors
         {"insidever-color", required_argument, NULL, 300},
@@ -2615,6 +2654,10 @@ int main(int argc, char *argv[]) {
                 if (blur_scale < 1) blur_scale = 1;
                 if (blur_scale > 8) blur_scale = 8;
                 break;
+            case 907:
+                ind_blur_radius = atoi(optarg);
+                if (ind_blur_radius < 0) ind_blur_radius = 0;
+                break;
             default:
                         break;
                 }
@@ -2988,18 +3031,20 @@ int main(int argc, char *argv[]) {
     ev_invoke(main_loop, xcb_check, 0);
 
     if (show_clock || bar_enabled || slideshow_enabled) {
-        if (redraw_thread) {
-            struct timespec ts;
-            double s;
-            double ns = modf(refresh_rate, &s);
-            ts.tv_sec = (time_t) s;
-            ts.tv_nsec = ns * NANOSECONDS_IN_SECOND;
-            (void) pthread_create(&draw_thread, NULL, start_time_redraw_tick_pthread, (void*) &ts);
-        } else {
-            start_time_redraw_tick(main_loop);
-        }
+        start_time_redraw_tick(main_loop);
+    }
+    if (redraw_thread) {
+        (void)pthread_create(&draw_thread, NULL, render_thread_func, NULL);
     }
     ev_loop(main_loop, 0);
+
+    if (redraw_thread) {
+        pthread_mutex_lock(&render_cond_mutex);
+        render_shutdown = true;
+        pthread_cond_signal(&render_cond);
+        pthread_mutex_unlock(&render_cond_mutex);
+        pthread_join(draw_thread, NULL);
+    }
 
 #ifndef __OpenBSD__
     if (pam_cleanup) {

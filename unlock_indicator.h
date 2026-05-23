@@ -47,6 +47,11 @@ typedef enum {
     MAX,
 } background_type_t;
 
+typedef enum {
+    REDRAW_FULL = 0,
+    REDRAW_PARTIAL = 1,
+} redraw_mode_t;
+
 
 typedef enum {
     CC_POS_RESET,
