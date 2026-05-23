@@ -29,6 +29,7 @@
 
 /* clock stuff */
 #include <time.h>
+#include <pthread.h>
 
 extern double circle_radius;
 extern double ring_width;
@@ -1313,10 +1314,29 @@ void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ct
 }
 
 /*
+ * Mutex protecting redraw_screen() from concurrent calls between the main
+ * event loop and the --redraw-thread pthread. Uses PTHREAD_MUTEX_RECURSIVE so
+ * that clear_indicator() → redraw_screen() re-entry from the same thread does
+ * not deadlock.
+ */
+static pthread_mutex_t redraw_mutex;
+static pthread_once_t redraw_mutex_once = PTHREAD_ONCE_INIT;
+
+static void init_redraw_mutex(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&redraw_mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+/*
  * Calls render_lock on a new pixmap and swaps that with the current pixmap
  *
  */
 void redraw_screen(void) {
+    pthread_once(&redraw_mutex_once, init_redraw_mutex);
+    pthread_mutex_lock(&redraw_mutex);
     DEBUG("redraw_screen(unlock_state = %d, auth_state = %d) @ [%lu]\n", unlock_state, auth_state, (unsigned long)time(NULL));
     xcb_pixmap_t pixmap = create_bg_pixmap(conn, win, last_resolution, color);
     render_lock(last_resolution, pixmap);
@@ -1324,6 +1344,7 @@ void redraw_screen(void) {
     xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
     xcb_free_pixmap(conn, pixmap);
     xcb_flush(conn);
+    pthread_mutex_unlock(&redraw_mutex);
 }
 
 /*
