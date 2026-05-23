@@ -39,6 +39,7 @@
 #include <string.h>
 #include <ev.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <xkbcommon/xkbcommon.h>
 #if XKBCOMPOSE == 1
 #include <xkbcommon/xkbcommon-compose.h>
@@ -701,6 +702,35 @@ static bool skip_without_validation(void) {
 }
 
 /*
+ * Executes @cmd via "/bin/sh -c" using a double-fork so that the child is
+ * immediately reparented to init and does not become a zombie.  Avoids the
+ * shell-injection risk of system(3) (which inherits SIGCHLD disposition and
+ * blocked signals from the caller) and does not block the event loop.
+ */
+static void exec_cmd(const char *cmd) {
+    if (!cmd || !*cmd)
+        return;
+    pid_t pid = fork();
+    if (pid < 0)
+        return;
+    if (pid == 0) {
+        /* First child: fork again so grandchild is re-parented to init */
+        pid_t pid2 = fork();
+        if (pid2 < 0)
+            _exit(1);
+        if (pid2 == 0) {
+            /* Grandchild: exec the command */
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        }
+        /* First child exits immediately, leaving grandchild to init */
+        _exit(0);
+    }
+    /* Parent: reap the first child (exits instantly) */
+    waitpid(pid, NULL, 0);
+}
+
+/*
  * Handle key presses. Fixes state, then looks up the key symbol for the
  * given keycode, then looks up the key symbol (as UCS-2), converts it to
  * UTF-8 and stores it in the password array.
@@ -753,85 +783,85 @@ static void handle_key_press(xcb_key_press_event_t *event) {
         switch(ksym) {
             case XKB_KEY_XF86MonBrightnessUp:
                 if (cmd_brightness_up) {
-                    system(cmd_brightness_up);
+                    exec_cmd(cmd_brightness_up);
                     return;
                 }
                 break;
             case XKB_KEY_XF86MonBrightnessDown:
                 if (cmd_brightness_down) {
-                    system(cmd_brightness_down);
+                    exec_cmd(cmd_brightness_down);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioPlay:
                 if (cmd_media_play) {
-                    system(cmd_media_play);
+                    exec_cmd(cmd_media_play);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioPause:
                 if (cmd_media_pause) {
-                    system(cmd_media_pause);
+                    exec_cmd(cmd_media_pause);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioStop:
                 if (cmd_media_stop) {
-                    system(cmd_media_stop);
+                    exec_cmd(cmd_media_stop);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioPrev:
                 if (cmd_media_prev) {
-                    system(cmd_media_prev);
+                    exec_cmd(cmd_media_prev);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioNext:
                 if (cmd_media_next) {
-                    system(cmd_media_next);
+                    exec_cmd(cmd_media_next);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioMute:
                 if (cmd_audio_mute) {
-                    system(cmd_audio_mute);
+                    exec_cmd(cmd_audio_mute);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioLowerVolume:
                 if (cmd_volume_down) {
-                    system(cmd_volume_down);
+                    exec_cmd(cmd_volume_down);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioRaiseVolume:
                 if (cmd_volume_up) {
-                    system(cmd_volume_up);
+                    exec_cmd(cmd_volume_up);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioMicMute:
                 if (cmd_mic_mute) {
-                    system(cmd_mic_mute);
+                    exec_cmd(cmd_mic_mute);
                     return;
                 }
                 break;
             case XKB_KEY_XF86PowerDown:
                 if (cmd_power_down) {
-                    system(cmd_power_down);
+                    exec_cmd(cmd_power_down);
                     return;
                 }
                 break;
             case XKB_KEY_XF86PowerOff:
                 if (cmd_power_off) {
-                    system(cmd_power_off);
+                    exec_cmd(cmd_power_off);
                     return;
                 }
                 break;
             case XKB_KEY_XF86Sleep:
                 if (cmd_power_sleep) {
-                    system(cmd_power_sleep);
+                    exec_cmd(cmd_power_sleep);
                     return;
                 }
                 break;
