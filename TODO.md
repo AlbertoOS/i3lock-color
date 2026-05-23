@@ -229,11 +229,11 @@
 
 ## Build / Maintenance
 
-### MEDIUM: PAM config sed in configure.ac is fragile
+### ✅ MEDIUM: PAM config sed in configure.ac is fragile — **FIXED in 956d351**
 
 **Problem:** configure.ac:83-84 uses `sed -i` to modify `../pam/i3lock` during configuration. This modifies the source file in-place, fails in out-of-tree builds, and makes the build non-reproducible.
 
-**Fix:** Use `AC_CONFIG_FILES` to generate the PAM file from a template (`pam/i3lock.in`), using an autoconf substitution variable for the `include` target.
+**Fix:** Created `pam/i3lock.in` template with `@PAM_AUTH_LINE@` substitution. configure.ac sets `PAM_AUTH_LINE` based on distro detection and uses `AC_CONFIG_FILES([pam/i3lock])` to generate the file at configure time. `pam/i3lock` added to `.gitignore`.
 
 ---
 
