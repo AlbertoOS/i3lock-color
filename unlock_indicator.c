@@ -38,6 +38,45 @@ extern double ring_width;
 #define BUTTON_SPACE (BUTTON_RADIUS + (RING_WIDTH / 2))
 #define BUTTON_DIAMETER (2 * BUTTON_SPACE)
 
+/*
+ * Cached tinyexpr state for render_lock().
+ *
+ * Expressions are compiled once on the first call to render_lock() and
+ * reused on every subsequent call (every keypress, clock tick, etc.).
+ * The te_variable array points to file-scope doubles that are updated
+ * before each te_eval() call, so the cached expressions always see the
+ * correct per-screen values.
+ */
+static double te_var_w, te_var_h, te_var_x, te_var_y;
+static double te_var_ix, te_var_iy, te_var_tx, te_var_ty;
+static double te_var_dx, te_var_dy, te_var_bw, te_var_bx, te_var_by, te_var_r;
+
+/* clang-format off */
+static te_variable te_cached_vars[14] = {
+    {"w",  &te_var_w},  {"h",  &te_var_h},
+    {"x",  &te_var_x},  {"y",  &te_var_y},
+    {"ix", &te_var_ix}, {"iy", &te_var_iy},
+    {"tx", &te_var_tx}, {"ty", &te_var_ty},
+    {"dx", &te_var_dx}, {"dy", &te_var_dy},
+    {"bw", &te_var_bw}, {"bx", &te_var_bx},
+    {"by", &te_var_by}, {"r",  &te_var_r},
+};
+/* clang-format on */
+
+static te_expr *te_cached_ind_x = NULL, *te_cached_ind_y = NULL;
+static te_expr *te_cached_time_x = NULL, *te_cached_time_y = NULL;
+static te_expr *te_cached_date_x = NULL, *te_cached_date_y = NULL;
+static te_expr *te_cached_layout_x = NULL, *te_cached_layout_y = NULL;
+static te_expr *te_cached_status_x = NULL, *te_cached_status_y = NULL;
+static te_expr *te_cached_verif_x = NULL, *te_cached_verif_y = NULL;
+static te_expr *te_cached_wrong_x = NULL, *te_cached_wrong_y = NULL;
+static te_expr *te_cached_modif_x = NULL, *te_cached_modif_y = NULL;
+static te_expr *te_cached_bar_x = NULL;
+static te_expr *te_cached_bar_y = NULL;     /* NULL when bar_y_expr is empty */
+static te_expr *te_cached_bar_width = NULL; /* NULL when bar_width_expr is empty */
+static te_expr *te_cached_greeter_x = NULL, *te_cached_greeter_y = NULL;
+static bool te_exprs_compiled = false;
+
 /*******************************************************************************
  * Variables defined in i3lock.c.
  ******************************************************************************/
@@ -983,45 +1022,34 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
           scaling_factor, button_diameter_physical);
 
     // variable mapping for evaluating the clock position expression
-    const unsigned int vars_size = 14;
-    te_variable vars[] =
-        {{"w", &width},
-         {"h", &height},
-         {"x", &screen_x},
-         {"y", &screen_y},
-         {"ix", &draw_data.indicator_x},
-         {"iy", &draw_data.indicator_y},
-         {"tx", &draw_data.time_text.x},
-         {"ty", &draw_data.time_text.y},
-         {"dx", &draw_data.date_text.x},
-         {"dy", &draw_data.date_text.y},
-         {"bw", &draw_data.bar_width},
-         {"bx", &draw_data.bar_x},
-         {"by", &draw_data.bar_y},
-         {"r", &radius}};
-
-    te_expr *te_ind_x_expr = compile_expression("--indpos", ind_x_expr, vars, vars_size);
-    te_expr *te_ind_y_expr = compile_expression("--indpos", ind_y_expr, vars, vars_size);
-    te_expr *te_time_x_expr = compile_expression("--timepos", time_x_expr, vars, vars_size);
-    te_expr *te_time_y_expr = compile_expression("--timepos", time_y_expr, vars, vars_size);
-    te_expr *te_date_x_expr = compile_expression("--datepos", date_x_expr, vars, vars_size);
-    te_expr *te_date_y_expr = compile_expression("--datepos", date_y_expr, vars, vars_size);
-    te_expr *te_layout_x_expr = compile_expression("--layoutpos", layout_x_expr, vars, vars_size);
-    te_expr *te_layout_y_expr = compile_expression("--layoutpos", layout_y_expr, vars, vars_size);
-    te_expr *te_status_x_expr = compile_expression("--statuspos", status_x_expr, vars, vars_size);
-    te_expr *te_status_y_expr = compile_expression("--statuspos", status_y_expr, vars, vars_size);
-    te_expr *te_verif_x_expr = compile_expression("--verifpos", verif_x_expr, vars, vars_size);
-    te_expr *te_verif_y_expr = compile_expression("--verifpos", verif_y_expr, vars, vars_size);
-    te_expr *te_wrong_x_expr = compile_expression("--wrongpos", wrong_x_expr, vars, vars_size);
-    te_expr *te_wrong_y_expr = compile_expression("--wrongpos", wrong_y_expr, vars, vars_size);
-    te_expr *te_modif_x_expr = compile_expression("--modifpos", modif_x_expr, vars, vars_size);
-    te_expr *te_modif_y_expr = compile_expression("--modifpos", modif_y_expr, vars, vars_size);
-    te_expr *te_bar_x_expr = compile_expression("--bar-position", bar_x_expr, vars, vars_size);
-    te_expr *te_bar_y_expr = strlen(bar_y_expr) ? compile_expression("--bar-position", bar_y_expr, vars, vars_size) : NULL;
-    te_expr *te_bar_width_expr = strlen(bar_width_expr) ? compile_expression("--bar-width", bar_width_expr, vars, vars_size) : NULL;
-
-    te_expr *te_greeter_x_expr = compile_expression("--greeterpos", greeter_x_expr, vars, vars_size);
-    te_expr *te_greeter_y_expr = compile_expression("--greeterpos", greeter_y_expr, vars, vars_size);
+    /* Compile all tinyexpr expressions once on first call; reuse thereafter.
+     * The cached_vars[] array points to file-scope doubles that are updated
+     * below before each te_eval() so the cached trees see current values. */
+    if (!te_exprs_compiled) {
+        const unsigned int vars_size = 14;
+        te_cached_ind_x = compile_expression("--indpos", ind_x_expr, te_cached_vars, vars_size);
+        te_cached_ind_y = compile_expression("--indpos", ind_y_expr, te_cached_vars, vars_size);
+        te_cached_time_x = compile_expression("--timepos", time_x_expr, te_cached_vars, vars_size);
+        te_cached_time_y = compile_expression("--timepos", time_y_expr, te_cached_vars, vars_size);
+        te_cached_date_x = compile_expression("--datepos", date_x_expr, te_cached_vars, vars_size);
+        te_cached_date_y = compile_expression("--datepos", date_y_expr, te_cached_vars, vars_size);
+        te_cached_layout_x = compile_expression("--layoutpos", layout_x_expr, te_cached_vars, vars_size);
+        te_cached_layout_y = compile_expression("--layoutpos", layout_y_expr, te_cached_vars, vars_size);
+        te_cached_status_x = compile_expression("--statuspos", status_x_expr, te_cached_vars, vars_size);
+        te_cached_status_y = compile_expression("--statuspos", status_y_expr, te_cached_vars, vars_size);
+        te_cached_verif_x = compile_expression("--verifpos", verif_x_expr, te_cached_vars, vars_size);
+        te_cached_verif_y = compile_expression("--verifpos", verif_y_expr, te_cached_vars, vars_size);
+        te_cached_wrong_x = compile_expression("--wrongpos", wrong_x_expr, te_cached_vars, vars_size);
+        te_cached_wrong_y = compile_expression("--wrongpos", wrong_y_expr, te_cached_vars, vars_size);
+        te_cached_modif_x = compile_expression("--modifpos", modif_x_expr, te_cached_vars, vars_size);
+        te_cached_modif_y = compile_expression("--modifpos", modif_y_expr, te_cached_vars, vars_size);
+        te_cached_bar_x = compile_expression("--bar-position", bar_x_expr, te_cached_vars, vars_size);
+        te_cached_bar_y = strlen(bar_y_expr) ? compile_expression("--bar-position", bar_y_expr, te_cached_vars, vars_size) : NULL;
+        te_cached_bar_width = strlen(bar_width_expr) ? compile_expression("--bar-width", bar_width_expr, te_cached_vars, vars_size) : NULL;
+        te_cached_greeter_x = compile_expression("--greeterpos", greeter_x_expr, te_cached_vars, vars_size);
+        te_cached_greeter_y = compile_expression("--greeterpos", greeter_y_expr, te_cached_vars, vars_size);
+        te_exprs_compiled = true;
+    }
 
     if (xr_screens > 0) {
         if (screen_number < 0 || screen_number > xr_screens) {
@@ -1048,42 +1076,54 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
             screen_y = xr_resolutions[current_screen].y / scaling_factor;
             draw_data.screen_x = screen_x;
             draw_data.screen_y = screen_y;
-            draw_data.indicator_x = te_eval(te_ind_x_expr);
-            draw_data.indicator_y = te_eval(te_ind_y_expr);
-            draw_data.time_text.x = te_eval(te_time_x_expr);
-            draw_data.time_text.y = te_eval(te_time_y_expr);
-            draw_data.date_text.x = te_eval(te_date_x_expr);
-            draw_data.date_text.y = te_eval(te_date_y_expr);
-            draw_data.keylayout_text.x = te_eval(te_layout_x_expr);
-            draw_data.keylayout_text.y = te_eval(te_layout_y_expr);
-            draw_data.greeter_text.x = te_eval(te_greeter_x_expr);
-            draw_data.greeter_text.y = te_eval(te_greeter_y_expr);
+            /* Sync per-screen geometry into the cached te_variable doubles */
+            te_var_w = width;
+            te_var_h = height;
+            te_var_x = screen_x;
+            te_var_y = screen_y;
+            te_var_r = radius;
+            draw_data.indicator_x = te_eval(te_cached_ind_x);
+            draw_data.indicator_y = te_eval(te_cached_ind_y);
+            te_var_ix = draw_data.indicator_x;
+            te_var_iy = draw_data.indicator_y;
+            draw_data.time_text.x = te_eval(te_cached_time_x);
+            draw_data.time_text.y = te_eval(te_cached_time_y);
+            te_var_tx = draw_data.time_text.x;
+            te_var_ty = draw_data.time_text.y;
+            draw_data.date_text.x = te_eval(te_cached_date_x);
+            draw_data.date_text.y = te_eval(te_cached_date_y);
+            te_var_dx = draw_data.date_text.x;
+            te_var_dy = draw_data.date_text.y;
+            draw_data.keylayout_text.x = te_eval(te_cached_layout_x);
+            draw_data.keylayout_text.y = te_eval(te_cached_layout_y);
+            draw_data.greeter_text.x = te_eval(te_cached_greeter_x);
+            draw_data.greeter_text.y = te_eval(te_cached_greeter_y);
 
             switch (auth_state) {
                 case STATE_AUTH_VERIFY:
                 case STATE_AUTH_LOCK:
-                    draw_data.status_text.x = te_eval(te_verif_x_expr);
-                    draw_data.status_text.y = te_eval(te_verif_y_expr);
+                    draw_data.status_text.x = te_eval(te_cached_verif_x);
+                    draw_data.status_text.y = te_eval(te_cached_verif_y);
                     break;
                 case STATE_AUTH_WRONG:
                 case STATE_I3LOCK_LOCK_FAILED:
-                    draw_data.status_text.x = te_eval(te_wrong_x_expr);
-                    draw_data.status_text.y = te_eval(te_wrong_y_expr);
+                    draw_data.status_text.x = te_eval(te_cached_wrong_x);
+                    draw_data.status_text.y = te_eval(te_cached_wrong_y);
                     break;
                 default:
-                    draw_data.status_text.x = te_eval(te_status_x_expr);
-                    draw_data.status_text.y = te_eval(te_status_y_expr);
+                    draw_data.status_text.x = te_eval(te_cached_status_x);
+                    draw_data.status_text.y = te_eval(te_cached_status_y);
                     break;
             }
 
-            draw_data.mod_text.x = te_eval(te_modif_x_expr);
-            draw_data.mod_text.y = te_eval(te_modif_y_expr);
+            draw_data.mod_text.x = te_eval(te_cached_modif_x);
+            draw_data.mod_text.y = te_eval(te_cached_modif_y);
 
-            if (te_bar_y_expr) {
-                draw_data.bar_x = te_eval(te_bar_x_expr);
-                draw_data.bar_y = te_eval(te_bar_y_expr);
+            if (te_cached_bar_y) {
+                draw_data.bar_x = te_eval(te_cached_bar_x);
+                draw_data.bar_y = te_eval(te_cached_bar_y);
             } else {
-                double bar_offset = te_eval(te_bar_x_expr);
+                double bar_offset = te_eval(te_cached_bar_x);
                 if (bar_orientation == BAR_VERT) {
                     draw_data.bar_x = bar_offset;
                     draw_data.bar_y = screen_y;
@@ -1092,13 +1132,17 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
                     draw_data.bar_y = bar_offset;
                 }
             }
-            if (te_bar_width_expr)
-                draw_data.bar_width = te_eval(te_bar_width_expr);
+            if (te_cached_bar_width)
+                draw_data.bar_width = te_eval(te_cached_bar_width);
             else if (bar_orientation == BAR_VERT)
                 draw_data.bar_width = height;
             else
                 draw_data.bar_width = width;
 
+
+            te_var_bx = draw_data.bar_x;
+            te_var_by = draw_data.bar_y;
+            te_var_bw = draw_data.bar_width;
 
             DEBUG("Indicator at %fx%f on screen %d\n", draw_data.indicator_x, draw_data.indicator_y, current_screen + 1);
             DEBUG("Bar at %fx%f with width %f on screen %d\n", draw_data.bar_x, draw_data.bar_y, draw_data.bar_width, current_screen + 1);
@@ -1121,38 +1165,51 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         draw_data.indicator_x = width / 2;
         draw_data.indicator_y = height / 2;
 
-        draw_data.time_text.x = te_eval(te_time_x_expr);
-        draw_data.time_text.y = te_eval(te_time_y_expr);
-        draw_data.date_text.x = te_eval(te_date_x_expr);
-        draw_data.date_text.y = te_eval(te_date_y_expr);
-        draw_data.keylayout_text.x = te_eval(te_layout_x_expr);
-        draw_data.keylayout_text.y = te_eval(te_layout_y_expr);
-        draw_data.greeter_text.x = te_eval(te_greeter_x_expr);
-        draw_data.greeter_text.y = te_eval(te_greeter_y_expr);
+        /* Sync fallback geometry into cached te_variable doubles */
+        te_var_w = width;
+        te_var_h = height;
+        te_var_x = 0;
+        te_var_y = 0;
+        te_var_r = radius;
+        te_var_ix = draw_data.indicator_x;
+        te_var_iy = draw_data.indicator_y;
+
+        draw_data.time_text.x = te_eval(te_cached_time_x);
+        draw_data.time_text.y = te_eval(te_cached_time_y);
+        te_var_tx = draw_data.time_text.x;
+        te_var_ty = draw_data.time_text.y;
+        draw_data.date_text.x = te_eval(te_cached_date_x);
+        draw_data.date_text.y = te_eval(te_cached_date_y);
+        te_var_dx = draw_data.date_text.x;
+        te_var_dy = draw_data.date_text.y;
+        draw_data.keylayout_text.x = te_eval(te_cached_layout_x);
+        draw_data.keylayout_text.y = te_eval(te_cached_layout_y);
+        draw_data.greeter_text.x = te_eval(te_cached_greeter_x);
+        draw_data.greeter_text.y = te_eval(te_cached_greeter_y);
         switch (auth_state) {
             case STATE_AUTH_VERIFY:
             case STATE_AUTH_LOCK:
-                draw_data.status_text.x = te_eval(te_verif_x_expr);
-                draw_data.status_text.y = te_eval(te_verif_y_expr);
+                draw_data.status_text.x = te_eval(te_cached_verif_x);
+                draw_data.status_text.y = te_eval(te_cached_verif_y);
                 break;
             case STATE_AUTH_WRONG:
             case STATE_I3LOCK_LOCK_FAILED:
-                draw_data.status_text.x = te_eval(te_wrong_x_expr);
-                draw_data.status_text.y = te_eval(te_wrong_y_expr);
+                draw_data.status_text.x = te_eval(te_cached_wrong_x);
+                draw_data.status_text.y = te_eval(te_cached_wrong_y);
                 break;
             default:
-                draw_data.status_text.x = te_eval(te_status_x_expr);
-                draw_data.status_text.y = te_eval(te_status_y_expr);
+                draw_data.status_text.x = te_eval(te_cached_status_x);
+                draw_data.status_text.y = te_eval(te_cached_status_y);
                 break;
         }
-        draw_data.mod_text.x = te_eval(te_modif_x_expr);
-        draw_data.mod_text.y = te_eval(te_modif_y_expr);
+        draw_data.mod_text.x = te_eval(te_cached_modif_x);
+        draw_data.mod_text.y = te_eval(te_cached_modif_y);
 
-        if (te_bar_y_expr) {
-            draw_data.bar_x = te_eval(te_bar_x_expr);
-            draw_data.bar_y = te_eval(te_bar_y_expr);
+        if (te_cached_bar_y) {
+            draw_data.bar_x = te_eval(te_cached_bar_x);
+            draw_data.bar_y = te_eval(te_cached_bar_y);
         } else {
-            double bar_offset = te_eval(te_bar_x_expr);
+            double bar_offset = te_eval(te_cached_bar_x);
             if (bar_orientation == BAR_VERT) {
                 draw_data.bar_x = bar_offset;
                 draw_data.bar_y = screen_y;
@@ -1161,12 +1218,16 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
                 draw_data.bar_y = bar_offset;
             }
         }
-        if (te_bar_width_expr)
-            draw_data.bar_width = te_eval(te_bar_width_expr);
+        if (te_cached_bar_width)
+            draw_data.bar_width = te_eval(te_cached_bar_width);
         else if (bar_orientation == BAR_VERT)
             draw_data.bar_width = height;
         else
             draw_data.bar_width = width;
+
+        te_var_bx = draw_data.bar_x;
+        te_var_by = draw_data.bar_y;
+        te_var_bw = draw_data.bar_width;
 
         DEBUG("Indicator at %fx%f\n", draw_data.indicator_x, draw_data.indicator_y);
         DEBUG("Bar at %fx%f with width %f\n", draw_data.bar_x, draw_data.bar_y, draw_data.bar_width);
@@ -1178,28 +1239,6 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
 
         draw_elements(ctx, &draw_data);
     }
-
-    te_free(te_ind_x_expr);
-    te_free(te_ind_y_expr);
-    te_free(te_time_x_expr);
-    te_free(te_time_y_expr);
-    te_free(te_date_x_expr);
-    te_free(te_date_y_expr);
-    te_free(te_layout_x_expr);
-    te_free(te_layout_y_expr);
-    te_free(te_status_x_expr);
-    te_free(te_status_y_expr);
-    te_free(te_verif_x_expr);
-    te_free(te_verif_y_expr);
-    te_free(te_wrong_x_expr);
-    te_free(te_wrong_y_expr);
-    te_free(te_modif_x_expr);
-    te_free(te_modif_y_expr);
-    te_free(te_bar_x_expr);
-    te_free(te_bar_y_expr);
-    te_free(te_bar_width_expr);
-    te_free(te_greeter_x_expr);
-    te_free(te_greeter_y_expr);
 
     cairo_set_source_surface(xcb_ctx, output, 0, 0);
     cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
