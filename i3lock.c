@@ -207,6 +207,7 @@ char* greeter_text = "";
 bool blur = false;
 bool step_blur = false;
 int blur_sigma = 5;
+static int blur_scale = 1;
 
 /* do not verify password */
 bool no_verify = false;
@@ -1804,7 +1805,7 @@ static void *bg_load_thread(void *arg) {
     }
 
     if (args->do_blur && blur_bg_img != NULL) {
-        blur_image_surface(blur_bg_img, blur_sigma);
+        blur_image_surface(blur_bg_img, blur_sigma, blur_scale);
     }
 
     /* Signal render_lock() that blur_bg_img is safe to use */
@@ -1847,6 +1848,7 @@ int main(int argc, char *argv[]) {
         {"show-failed-attempts", no_argument, NULL, 'f'},
         {"screen", required_argument, NULL, 'S'},
         {"blur", required_argument, NULL, 'B'},
+        {"blur-scale", required_argument, NULL, 906},
 
         // options for unlock indicator colors
         {"insidever-color", required_argument, NULL, 300},
@@ -2596,7 +2598,12 @@ int main(int argc, char *argv[]) {
                         bar_bidirectional = true;
                         break;
                     case BAR_DEFAULT:
-                    default:
+            case 906:
+                blur_scale = atoi(optarg);
+                if (blur_scale < 1) blur_scale = 1;
+                if (blur_scale > 8) blur_scale = 8;
+                break;
+            default:
                         break;
                 }
                 break;
@@ -2918,7 +2925,7 @@ int main(int argc, char *argv[]) {
                 free(async_image_path);
             }
             if (blur && blur_bg_img != NULL) {
-                blur_image_surface(blur_bg_img, blur_sigma);
+                blur_image_surface(blur_bg_img, blur_sigma, blur_scale);
             }
             bg_ready = true;
             free(bg_args);

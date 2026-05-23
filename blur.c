@@ -128,32 +128,10 @@ static void box_blur_pass(uint32_t *src, uint32_t *dst, uint32_t *scratch,
 }
 
 /*
- * Applies a fast approximate Gaussian blur of standard deviation @sigma
- * to @surface in-place.
- *
- * Uses three sequential box-blur passes (Kovesi 2010), which runs in
- * O(W×H) time regardless of @sigma — replacing the original O(σ²)
- * repeated-box-filter algorithm that was catastrophically slow at high
- * sigma values on 4K displays.
+ * Pure blur computation: three box-blur ping-pong passes on a raw
+ * pixel buffer.  Caller is responsible for flush/mark_dirty.
  */
-void blur_image_surface(cairo_surface_t *surface, int sigma) {
-    if (cairo_surface_status(surface))
-        return;
-
-    if (sigma <= 0)
-        return;
-
-    cairo_format_t fmt = cairo_image_surface_get_format(surface);
-    if (fmt != CAIRO_FORMAT_ARGB32 && fmt != CAIRO_FORMAT_RGB24)
-        return;
-
-    cairo_surface_flush(surface);
-
-    int w = cairo_image_surface_get_width(surface);
-    int h = cairo_image_surface_get_height(surface);
-    uint32_t *data = (uint32_t *)cairo_image_surface_get_data(surface);
-
-    /* Allocate scratch buffers */
+static void do_blur(uint32_t *data, int w, int h, int sigma) {
     uint32_t *buf1 = malloc((size_t)w * h * sizeof(uint32_t));
     uint32_t *scratch = malloc((size_t)w * h * sizeof(uint32_t));
     if (!buf1 || !scratch) {
@@ -180,6 +158,84 @@ void blur_image_surface(cairo_surface_t *surface, int sigma) {
 
     free(buf1);
     free(scratch);
+}
 
+/*
+ * Applies a fast approximate Gaussian blur of standard deviation @sigma
+ * to @surface in-place.
+ *
+ * Uses three sequential box-blur passes (Kovesi 2010), which runs in
+ * O(W×H) time regardless of @sigma — replacing the original O(σ²)
+ * repeated-box-filter algorithm that was catastrophically slow at high
+ * sigma values on 4K displays.
+ *
+ * When @scale > 1, blurs at reduced resolution (w/scale × h/scale)
+ * then upscales back — trading a small amount of quality for a
+ * significant speed-up on large displays.
+ */
+void blur_image_surface(cairo_surface_t *surface, int sigma, int scale) {
+    if (cairo_surface_status(surface))
+        return;
+
+    if (sigma <= 0)
+        return;
+
+    cairo_format_t fmt = cairo_image_surface_get_format(surface);
+    if (fmt != CAIRO_FORMAT_ARGB32 && fmt != CAIRO_FORMAT_RGB24)
+        return;
+
+    cairo_surface_flush(surface);
+
+    int w = cairo_image_surface_get_width(surface);
+    int h = cairo_image_surface_get_height(surface);
+
+    if (scale <= 1) {
+        uint32_t *data = (uint32_t *)cairo_image_surface_get_data(surface);
+        do_blur(data, w, h, sigma);
+        cairo_surface_mark_dirty(surface);
+        return;
+    }
+
+    /* scale > 1: downscale, blur the small surface, upscale back */
+    int small_w = w / scale;
+    int small_h = h / scale;
+    if (small_w < 1) small_w = 1;
+    if (small_h < 1) small_h = 1;
+
+    cairo_surface_t *small = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, small_w, small_h);
+    if (cairo_surface_status(small) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(small);
+        /* Fallback: blur at full resolution */
+        uint32_t *data = (uint32_t *)cairo_image_surface_get_data(surface);
+        do_blur(data, w, h, sigma);
+        cairo_surface_mark_dirty(surface);
+        return;
+    }
+
+    /* Downscale: paint original onto small surface with scaling */
+    cairo_t *ctx = cairo_create(small);
+    cairo_scale(ctx, 1.0 / scale, 1.0 / scale);
+    cairo_set_source_surface(ctx, surface, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(ctx), CAIRO_FILTER_GOOD);
+    cairo_paint(ctx);
+    cairo_destroy(ctx);
+
+    /* Blur the small surface */
+    cairo_surface_flush(small);
+    uint32_t *small_data = (uint32_t *)cairo_image_surface_get_data(small);
+    int blur_sigma = sigma / scale;
+    if (blur_sigma < 1) blur_sigma = 1;
+    do_blur(small_data, small_w, small_h, blur_sigma);
+    cairo_surface_mark_dirty(small);
+
+    /* Upscale back: paint small surface onto original */
+    ctx = cairo_create(surface);
+    cairo_scale(ctx, scale, scale);
+    cairo_set_source_surface(ctx, small, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(ctx), CAIRO_FILTER_GOOD);
+    cairo_paint(ctx);
+    cairo_destroy(ctx);
+
+    cairo_surface_destroy(small);
     cairo_surface_mark_dirty(surface);
 }
