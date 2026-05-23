@@ -145,11 +145,11 @@
 
 ---
 
-### LOW: `FcInit()`/`FcFini()` called per font face
+### ✅ LOW: `FcInit()`/`FcFini()` called per font face
 
 **Problem:** `get_font_face()` in unlock_indicator.c calls `FcInit()` and `FcFini()` each time. While font faces are cached (only resolved once), the init/fini cycle is unnecessary after the first call and may cause issues if fontconfig has global state.
 
-**Fix:** Call `FcInit()` once at startup. Never call `FcFini()` (most programs don't — it's only for leak checkers).
+**Fix:** Removed `FcFini()` entirely. FcInit() is idempotent and fontconfig state persists for the process lifetime. *(commit 75832b8)*
 
 ---
 
@@ -245,11 +245,11 @@
 
 ---
 
-### LOW: Missing `-lpthread` in LDADD
+### ✅ LOW: Missing `-lpthread` in LDADD
 
 **Problem:** `Makefile.am` doesn't explicitly link `-lpthread` despite using `pthread_create`. The `-pthread` CFLAG (from configure.ac:124) handles both compilation and linking on most systems, but not all.
 
-**Fix:** Add `$(PTHREAD_LIBS)` to `i3lock_LDADD` or use `AX_PTHREAD` macro for proper detection.
+**Fix:** Added `AX_APPEND_FLAG([-pthread], [AM_LDFLAGS])` + `AC_SUBST(AM_LDFLAGS)` to configure.ac so -pthread is passed at both compile and link time. *(commit 75832b8)*
 
 ---
 
