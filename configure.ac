@@ -77,12 +77,17 @@ AC_SEARCH_LIBS([ev_run], [ev], , [AC_MSG_FAILURE([cannot find the required ev_ru
 AC_SEARCH_LIBS([shm_open], [rt])
 
 AC_SEARCH_LIBS([DGifOpenFileName], [gif])
-# Use system-local-login instead of login on Arch and Gentoo
+# Use system-local-login instead of login on Arch and Gentoo.
+# Set PAM_AUTH_LINE which is substituted into pam/i3lock.in → pam/i3lock
+# by AC_CONFIG_FILES below. This avoids sed -i on the source tree, which
+# breaks out-of-tree builds and corrupts the source file on re-configure.
 if [[ -f /etc/arch-release ]] || [[ -f /etc/gentoo-release ]]; then
     echo "Using PAM for Arch/Gentoo"
-    sed -i "s/^#auth include system-local-login/auth include system-local-login/g" ../pam/i3lock
-    sed -i "s/^auth include login/#auth include login/g" ../pam/i3lock
+    PAM_AUTH_LINE="auth include system-local-login"
+else
+    PAM_AUTH_LINE="auth include login"
 fi
+AC_SUBST([PAM_AUTH_LINE])
 
 # Only disable PAM on OpenBSD where i3lock uses BSD Auth instead
 case "$host" in
@@ -133,7 +138,7 @@ AX_CHECK_ZSH_COMPLETION
 # Checks for header files.
 AC_CHECK_HEADERS([fcntl.h float.h inttypes.h limits.h locale.h netinet/in.h paths.h stddef.h stdint.h stdlib.h string.h sys/param.h sys/socket.h sys/time.h unistd.h gif_lib.h], , [AC_MSG_FAILURE([cannot find the $ac_header header, which i3lock requires])])
 
-AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([Makefile pam/i3lock])
 
 # Enable address sanitizer for debug builds. The performance hit is a
 # 50% increase of wallclock time for the testsuite on my machine.
