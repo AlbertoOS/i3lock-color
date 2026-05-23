@@ -108,6 +108,7 @@ extern char *img_slideshow[256];
 extern cairo_surface_t *blur_bg_img;
 extern volatile bool bg_ready;
 extern int slideshow_image_count;
+extern int gif_img_count;
 extern int slideshow_interval;
 extern bool slideshow_random_selection;
 int slideshow_image_now = 0;
@@ -231,6 +232,29 @@ static struct ev_periodic *time_redraw_tick;
 static xcb_visualtype_t *vistype;
 
 int current_slideshow_index = 0;
+
+/*******************************************************************************
+ * Background cache.
+ *
+ * The background (blur/solid color + image overlay) is expensive to composite
+ * but only changes on: initial bg_ready, slideshow frame change, GIF frame,
+ * or screen resize.  We cache it as a cairo image surface and blit it on
+ * subsequent render_lock() calls (every keypress / clock tick).
+ ******************************************************************************/
+static cairo_surface_t *bg_cache = NULL;
+static uint32_t bg_cache_w = 0, bg_cache_h = 0;
+static int bg_cache_slideshow_idx = -1;
+
+/*
+ * Invalidate the background cache.  Called from handle_screen_resize() (in
+ * i3lock.c) and internally when slideshow/GIF changes are detected.
+ */
+void invalidate_bg_cache(void) {
+    if (bg_cache) {
+        cairo_surface_destroy(bg_cache);
+        bg_cache = NULL;
+    }
+}
 
 /* Maintain the current unlock/PAM state to draw the appropriate unlock
  * indicator. */
@@ -831,10 +855,11 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
     cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, drawable, vistype, resolution[0], resolution[1]);
     cairo_t *xcb_ctx = cairo_create(xcb_output);
 
-    /*update image according to the slideshow_interval*/
+    /* --- Slideshow: advance frame if interval elapsed --- */
+    bool slideshow_changed = false;
     if (slideshow_image_count > 0) {
         unsigned long now = (unsigned long)time(NULL);
-        if (img == NULL || now - lastCheck >= slideshow_interval) {
+        if (img == NULL || now - lastCheck >= (unsigned long)slideshow_interval) {
             if (slideshow_random_selection) {
                 img = load_image(img_slideshow[rand() % slideshow_image_count]);
             } else {
@@ -846,20 +871,63 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
                 load_slideshow_images(slideshow_path);
             }
             lastCheck = now;
+            slideshow_changed = true;
         }
     }
 
-    if (blur_bg_img && bg_ready) {
-        cairo_set_source_surface(xcb_ctx, blur_bg_img, 0, 0);
-        cairo_paint(xcb_ctx);
-    } else {
-        cairo_set_source_rgba(xcb_ctx, background.red, background.green, background.blue, background.alpha);
-        cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
-        cairo_fill(xcb_ctx);
+    /* --- Background cache ---
+     * Cache the composited background (blur/color + image) as a client-side
+     * image surface. Invalidate when resolution, slideshow, or GIF changes.
+     * GIF mode: never cache (frame changes every tick).
+     * Before bg_ready: paint fallback without caching.
+     */
+    if (bg_cache != NULL &&
+        (bg_cache_w != resolution[0] || bg_cache_h != resolution[1] ||
+         slideshow_changed || gif_img_count > 0)) {
+        invalidate_bg_cache();
     }
 
-    if (img) {
-        draw_image(resolution, img, xcb_ctx);
+    if (bg_cache != NULL) {
+        /* FAST PATH: blit cached background */
+        cairo_set_source_surface(xcb_ctx, bg_cache, 0, 0);
+        cairo_paint(xcb_ctx);
+    } else {
+        /* SLOW PATH: composite background from scratch */
+        /* Use a temporary image surface so we can cache without X round-trips */
+        cairo_surface_t *bg_surf = cairo_image_surface_create(
+            CAIRO_FORMAT_ARGB32, resolution[0], resolution[1]);
+        cairo_t *bg_ctx = cairo_create(bg_surf);
+
+        if (blur_bg_img && bg_ready) {
+            cairo_set_source_surface(bg_ctx, blur_bg_img, 0, 0);
+            cairo_paint(bg_ctx);
+        } else {
+            cairo_set_source_rgba(bg_ctx, background.red, background.green,
+                                  background.blue, background.alpha);
+            cairo_rectangle(bg_ctx, 0, 0, resolution[0], resolution[1]);
+            cairo_fill(bg_ctx);
+        }
+
+        if (img) {
+            draw_image(resolution, img, bg_ctx);
+        }
+
+        cairo_destroy(bg_ctx);
+
+        /* Blit the freshly-painted background to the XCB target */
+        cairo_set_source_surface(xcb_ctx, bg_surf, 0, 0);
+        cairo_paint(xcb_ctx);
+
+        /* Cache it for future frames (only if background is final) */
+        if (bg_ready && gif_img_count == 0) {
+            bg_cache = bg_surf; /* transfer ownership */
+            bg_cache_w = resolution[0];
+            bg_cache_h = resolution[1];
+            bg_cache_slideshow_idx = current_slideshow_index;
+            DEBUG("bg_cache populated (%ux%u)\n", bg_cache_w, bg_cache_h);
+        } else {
+            cairo_surface_destroy(bg_surf); /* transient, don't keep */
+        }
     }
 
     /*

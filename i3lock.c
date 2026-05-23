@@ -1136,6 +1136,8 @@ static void handle_screen_resize(void) {
 
     free(geom);
 
+    invalidate_bg_cache();
+
     redraw_screen();
 
     uint32_t mask = XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT;

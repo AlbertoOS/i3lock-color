@@ -71,4 +71,5 @@ void clear_indicator(void);
 void start_time_redraw_timeout(void);
 void* start_time_redraw_tick_pthread(void* arg);
 void start_time_redraw_tick(struct ev_loop* main_loop);
+void invalidate_bg_cache(void);
 #endif
