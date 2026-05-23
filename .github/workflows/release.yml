@@ -23,12 +23,16 @@ jobs:
         run: |
           pacman -S --noconfirm \
             xcb-util-image \
+            xcb-util \
+            xcb-util-xrm \
+            libxcb \
             pam \
             libev \
             cairo \
+            fontconfig \
             libxkbcommon-x11 \
             libjpeg-turbo \
-            xcb-util-xrm \
+            giflib \
             pkgconf \
             autoconf \
             automake
