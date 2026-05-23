@@ -846,14 +846,16 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
      * depending on the amount of screens) unlock indicators on.
      * create two more surfaces for time and date display
      */
-    cairo_surface_t *output = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, resolution[0], resolution[1]);
-    cairo_t *ctx = cairo_create(output);
+    cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, drawable, vistype, resolution[0], resolution[1]);
+    cairo_t *xcb_ctx = cairo_create(xcb_output);
+
+    /* Draw directly onto XCB surface — avoids 33MB intermediate surface
+     * and the full-screen OVER composite that dominated render time. */
+    cairo_t *ctx = xcb_ctx;
+    cairo_save(ctx);
     cairo_scale(ctx, scaling_factor, scaling_factor);
 
     //    cairo_set_font_face(ctx, get_font_face(0));
-
-    cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, drawable, vistype, resolution[0], resolution[1]);
-    cairo_t *xcb_ctx = cairo_create(xcb_output);
 
     /* --- Slideshow: advance frame if interval elapsed --- */
     bool slideshow_changed = false;
@@ -1312,13 +1314,9 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         draw_elements(ctx, &draw_data);
     }
 
-    cairo_set_source_surface(xcb_ctx, output, 0, 0);
-    cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
-    cairo_fill(xcb_ctx);
+    cairo_restore(ctx);  /* undo cairo_scale(ctx, scaling_factor, scaling_factor) */
 
     cairo_surface_destroy(xcb_output);
-    cairo_surface_destroy(output);
-    cairo_destroy(ctx);
     cairo_destroy(xcb_ctx);
 }
 
@@ -1403,15 +1401,28 @@ static void init_redraw_mutex(void) {
  * Calls render_lock on a new pixmap and swaps that with the current pixmap
  *
  */
+static xcb_pixmap_t persistent_pixmap = XCB_NONE;
+static uint32_t persistent_pix_w = 0, persistent_pix_h = 0;
+
 void redraw_screen(void) {
     pthread_once(&redraw_mutex_once, init_redraw_mutex);
     pthread_mutex_lock(&redraw_mutex);
     DEBUG("redraw_screen(unlock_state = %d, auth_state = %d) @ [%lu]\n", unlock_state, auth_state, (unsigned long)time(NULL));
-    xcb_pixmap_t pixmap = create_bg_pixmap(conn, win, last_resolution, color);
-    render_lock(last_resolution, pixmap);
-    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[1]){pixmap});
+
+    /* Reuse server-side pixmap across frames (saves alloc/free per keypress) */
+    if (persistent_pixmap == XCB_NONE ||
+        persistent_pix_w != last_resolution[0] ||
+        persistent_pix_h != last_resolution[1]) {
+        if (persistent_pixmap != XCB_NONE)
+            xcb_free_pixmap(conn, persistent_pixmap);
+        persistent_pixmap = create_bg_pixmap(conn, win, last_resolution, color);
+        persistent_pix_w = last_resolution[0];
+        persistent_pix_h = last_resolution[1];
+    }
+
+    render_lock(last_resolution, persistent_pixmap);
+    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[1]){persistent_pixmap});
     xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
-    xcb_free_pixmap(conn, pixmap);
     xcb_flush(conn);
     pthread_mutex_unlock(&redraw_mutex);
 }

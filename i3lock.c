@@ -302,6 +302,7 @@ pthread_t draw_thread;
 // main thread still sometimes calls redraw()
 // allow you to disable. handy if you use bar with lots of crap.
 bool redraw_thread = false;
+static bool redraw_needed = false;
 
 // experimental bar stuff
 #define BAR_VERT 0
@@ -690,6 +691,8 @@ static void input_done(void) {
 }
 
 static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
+    if (unlock_state == STATE_KEY_ACTIVE || unlock_state == STATE_BACKSPACE_ACTIVE)
+        unlock_state = STATE_KEY_PRESSED;
     redraw_screen();
     STOP_TIMER(w);
 }
@@ -995,8 +998,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
              * empty. */
             START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
             unlock_state = STATE_BACKSPACE_ACTIVE;
-            redraw_screen();
-            unlock_state = STATE_KEY_PRESSED;
+            redraw_needed = true;
             return;
     }
 
@@ -1024,8 +1026,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
 
     if (unlock_indicator) {
         unlock_state = STATE_KEY_ACTIVE;
-        redraw_screen();
-        unlock_state = STATE_KEY_PRESSED;
+        redraw_needed = true;
 
         struct ev_timer *timeout = NULL;
         START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
@@ -1627,6 +1628,13 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
         }
 
         free(event);
+    }
+
+    /* Coalesced redraw: drain all pending XCB events first, then redraw once.
+     * Typing 5 keys in 20ms triggers 1 redraw instead of 5. */
+    if (redraw_needed) {
+        redraw_needed = false;
+        redraw_screen();
     }
 }
 
