@@ -25,18 +25,18 @@ endif
 
 install-data-hook:
 if ENABLE_BASH_COMPLETION
-	test -f "${BASH_COMPLETION_DIR}/i3lock-bash" && mv -f "${BASH_COMPLETION_DIR}/i3lock-bash" "${BASH_COMPLETION_DIR}/i3lock" || true
+	test -f "$(DESTDIR)$(BASH_COMPLETION_DIR)/i3lock-bash" && mv -f "$(DESTDIR)$(BASH_COMPLETION_DIR)/i3lock-bash" "$(DESTDIR)$(BASH_COMPLETION_DIR)/i3lock" || true
 endif
 if ENABLE_ZSH_COMPLETION
-	test -f "${ZSH_COMPLETION_DIR}/i3lock-zsh" && mv -f "${ZSH_COMPLETION_DIR}/i3lock-zsh" "${ZSH_COMPLETION_DIR}/_i3lock" || true
+	test -f "$(DESTDIR)$(ZSH_COMPLETION_DIR)/i3lock-zsh" && mv -f "$(DESTDIR)$(ZSH_COMPLETION_DIR)/i3lock-zsh" "$(DESTDIR)$(ZSH_COMPLETION_DIR)/_i3lock" || true
 endif
 
 uninstall-hook:
 if ENABLE_BASH_COMPLETION
-	rm -f ${BASH_COMPLETION_DIR}/i3lock
+	rm -f $(DESTDIR)$(BASH_COMPLETION_DIR)/i3lock
 endif
 if ENABLE_ZSH_COMPLETION
-	rm -f ${ZSH_COMPLETION_DIR}/_i3lock
+	rm -f $(DESTDIR)$(ZSH_COMPLETION_DIR)/_i3lock
 endif
 
 
