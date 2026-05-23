@@ -19,6 +19,7 @@
 #include <pwd.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -587,6 +588,7 @@ static void input_done(void) {
     redraw_screen();
 
     if (no_verify) {
+        fprintf(stderr, "WARNING: --no-verify is active — screen is NOT secured, any key unlocks\n");
         ev_break(EV_DEFAULT, EVBREAK_ALL);
         return;
     }
@@ -985,7 +987,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     /* store it in the password array as UTF-8 */
     memcpy(password + input_position, buffer, n - 1);
     input_position += n - 1;
-    DEBUG("current password = %.*s\n", input_position, password);
+    DEBUG("password length = %d\n", input_position);
 
     if (unlock_indicator) {
         unlock_state = STATE_KEY_ACTIVE;
@@ -1243,7 +1245,7 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
         int img_bottom = img_top + pimg->ImageDesc.Height;
 
         /* Handle disposal mode */
-        int data_size = width * height * ((int)sizeof(width));
+        int data_size = width * height * ((int)sizeof(uint32_t));
         switch (gc.DisposalMode) {
             case DISPOSE_DO_NOT:
                 if (data_prev) {
@@ -1252,9 +1254,12 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
                     memset(data, 0, data_size);
                 }
                 break;
-            case DISPOSE_BACKGROUND:
-                memset(data, bg_color, data_size);
+            case DISPOSE_BACKGROUND: {
+                uint32_t *pixels = data;
+                for (int i = 0; i < width * height; i++)
+                    pixels[i] = bg_color;
                 break;
+            }
             default:
                 memset(data, 0, data_size);
         }
@@ -1646,24 +1651,26 @@ static void raise_loop(xcb_window_t window) {
 }
 
 /*
- * Loads an image from the given path. Handles JPEG and PNG. Returns NULL in case of error.
+ * Loads an image from the given path. Detects format automatically.
+ * Returns NULL on error or unsupported format.
  */
-cairo_surface_t *load_image(enum IMAGE_FORMAT format) {
+cairo_surface_t *load_image(const char *path) {
     cairo_surface_t *img = NULL;
     JPEG_INFO jpg_info;
     unsigned char *jpg_data;
+    enum IMAGE_FORMAT format = verify_image(path);
 
     switch (format) {
         case IMAGE_FORMAT_RAW:
             /* Read image. 'read_raw_image' returns NULL on error,
              * so we don't have to handle errors here. */
-            img = read_raw_image(image_path, image_raw_format);
+            img = read_raw_image(path, image_raw_format);
             break;
         case IMAGE_FORMAT_PNG:
-            img = cairo_image_surface_create_from_png(image_path);
+            img = cairo_image_surface_create_from_png(path);
             break;
         case IMAGE_FORMAT_JPG:
-            jpg_data = read_JPEG_file(image_path, &jpg_info);
+            jpg_data = read_JPEG_file(path, &jpg_info);
             if (jpg_data != NULL) {
                 img = cairo_image_surface_create_for_data(jpg_data,
                                                           CAIRO_FORMAT_ARGB32, jpg_info.width, jpg_info.height,
@@ -1671,10 +1678,10 @@ cairo_surface_t *load_image(enum IMAGE_FORMAT format) {
             }
             break;
         case IMAGE_FORMAT_GIF:
-            img = read_gif_image(image_path);
+            img = read_gif_image(path);
             break;
         default:
-            fprintf(stderr, "Unsupported image file format: %s\n", image_path);
+            fprintf(stderr, "Unsupported image file format: %s\n", path);
     }
 
     /* In case loading failed, we just pretend no -i was specified. */
@@ -1718,10 +1725,8 @@ bool load_slideshow_images(const char *path) {
         int result = regexec(&reg, dir->d_name, 0, NULL, 0);
         if (result) continue;
 
-        char path_to_image[256];
-        strcpy(path_to_image, path);
-        strcat(path_to_image, "/");
-        strcat(path_to_image, dir->d_name);
+        char path_to_image[PATH_MAX];
+        snprintf(path_to_image, sizeof(path_to_image), "%s/%s", path, dir->d_name);
 
         img_slideshow[file_count] = strdup(path_to_image);
 
@@ -2743,14 +2748,12 @@ int main(int argc, char *argv[]) {
     init_colors_once();
     if (image_path != NULL) {
         if (!is_directory(image_path)) {
-            enum IMAGE_FORMAT image_format = verify_image(image_path);
-            img = load_image(image_format);
+            img = load_image(image_path);
         } else {
             /* Path to a directory is provided -> use slideshow mode */
             slideshow_path = strdup(image_path);
             if (!load_slideshow_images(slideshow_path)) exit(EXIT_FAILURE);
-            enum IMAGE_FORMAT image_format = verify_image(img_slideshow[0]);
-            img = load_image(image_format);
+            img = load_image(img_slideshow[0]);
         }
         free(image_path);
     }

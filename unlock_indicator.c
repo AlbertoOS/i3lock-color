@@ -165,7 +165,7 @@ extern char *layout_text;
 extern char *greeter_text;
 
 bool load_slideshow_images(const char *path);
-cairo_surface_t* load_image(char* image_path);
+cairo_surface_t *load_image(const char *path);
 
 /* Whether the failed attempts should be displayed. */
 extern bool show_failed_attempts;

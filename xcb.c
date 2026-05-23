@@ -86,7 +86,7 @@ static uint32_t get_colorpixel(char *hex) {
     char strgroups[4][3] = {{hex[0], hex[1], '\0'},
                             {hex[2], hex[3], '\0'},
                             {hex[4], hex[5], '\0'},
-                            {hex[6], hex[4], '\0'}};
+                            {hex[6], hex[7], '\0'}};
     uint32_t rgb16[4] = {(strtol(strgroups[0], NULL, 16)),
                          (strtol(strgroups[1], NULL, 16)),
                          (strtol(strgroups[2], NULL, 16)),
