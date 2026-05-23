@@ -40,6 +40,8 @@
 #include <ev.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <xkbcommon/xkbcommon.h>
 #if XKBCOMPOSE == 1
 #include <xkbcommon/xkbcommon-compose.h>
@@ -494,7 +496,7 @@ static void clear_password_memory(void) {
 #ifdef HAVE_EXPLICIT_BZERO
     /* Use explicit_bzero(3) which was explicitly designed not to be
      * optimized out by the compiler. */
-    explicit_bzero(password, strlen(password));
+    explicit_bzero(password, sizeof(password));
 #else
     /* A volatile pointer to the password buffer to prevent the compiler from
      * optimizing this out. */
@@ -2739,6 +2741,16 @@ int main(int argc, char *argv[]) {
     if (mlock(password, sizeof(password)) != 0)
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
 #endif
+
+    atexit(clear_password_memory);
+
+#if defined(__linux__)
+    /* Prevent core dumps — password buffer would be in cleartext */
+    prctl(PR_SET_DUMPABLE, 0);
+#endif
+    /* Belt-and-suspenders: also set RLIMIT_CORE to 0 */
+    struct rlimit core_limit = {0, 0};
+    setrlimit(RLIMIT_CORE, &core_limit);
 
     /* Double checking that connection is good and operatable with xcb */
     int screennr;

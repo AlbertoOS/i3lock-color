@@ -213,6 +213,8 @@ cairo_surface_t *load_image(const char *path);
 extern bool show_failed_attempts;
 /* Number of failed unlock attempts. */
 extern int failed_attempts;
+/* Whether password verification is disabled (--no-verify). */
+extern bool no_verify;
 
 /*******************************************************************************
  * Variables defined in xcb.c.
@@ -589,7 +591,7 @@ static void draw_bar(cairo_t *ctx, double bar_x, double bar_y, double bar_width,
 
 static void draw_indic(cairo_t *ctx, double ind_x, double ind_y) {
     if (unlock_indicator &&
-        (unlock_state >= STATE_KEY_PRESSED || auth_state > STATE_AUTH_IDLE || show_indicator)) {
+        (unlock_state >= STATE_KEY_PRESSED || auth_state > STATE_AUTH_IDLE || show_indicator || no_verify)) {
         /* Draw a (centered) circle with transparent background. */
         cairo_set_line_width(ctx, RING_WIDTH);
         cairo_arc(ctx, ind_x, ind_y, BUTTON_RADIUS, 0, 2 * M_PI);
@@ -657,6 +659,14 @@ static void draw_indic(cairo_t *ctx, double ind_x, double ind_y) {
                 break;
         }
         cairo_stroke(ctx);
+
+        /* --no-verify: override ring to bright red as a security warning */
+        if (no_verify) {
+            cairo_set_line_width(ctx, RING_WIDTH);
+            cairo_arc(ctx, ind_x, ind_y, BUTTON_RADIUS, 0, 2 * M_PI);
+            cairo_set_source_rgba(ctx, 1.0, 0.0, 0.0, 1.0);  /* bright red */
+            cairo_stroke(ctx);
+        }
 
         /* Draw an inner separator line. */
         if (internal_line_source != 2) {  //pretty sure this only needs drawn if it's being drawn over the inside?
@@ -1014,6 +1024,18 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
                 }
                 break;
         }
+    }
+
+    /* --no-verify: show UNSECURED warning in bright red */
+    if (no_verify) {
+        draw_data.status_text.show = true;
+        strncpy(draw_data.status_text.str, "UNSECURED", sizeof(draw_data.status_text.str) - 1);
+        draw_data.status_text.font = get_font_face(WRONG_FONT);
+        draw_data.status_text.color = (rgba_t){1.0, 0.0, 0.0, 1.0};  /* bright red */
+        draw_data.status_text.outline_color = (rgba_t){0.0, 0.0, 0.0, 0.0};
+        draw_data.status_text.size = verif_size > 0 ? verif_size : 28.0;
+        draw_data.status_text.outline_width = 0;
+        draw_data.status_text.align = verif_align;
     }
 
     if (modifier_string) {
