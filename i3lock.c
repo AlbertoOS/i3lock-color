@@ -262,6 +262,8 @@ int gif_img_count = 0;
 cairo_surface_t *img = NULL;
 char *img_slideshow[256];
 cairo_surface_t *blur_bg_img = NULL;
+/* Set to true by the background load thread once blur/image is ready to draw */
+volatile bool bg_ready = false;
 int slideshow_image_count = 0;
 int slideshow_interval = 10;
 bool slideshow_random_selection = false;
@@ -1782,6 +1784,37 @@ void gif_anim_loop(struct ev_loop *loop, struct ev_timer *timer, int delay) {
     ev_timer_start(loop, timer);
 }
 
+/* Arguments for the background load thread */
+struct bg_load_args {
+    char *image_path; /* non-NULL: load this single image into img */
+    bool do_blur;     /* true: blur blur_bg_img (pixels already captured) */
+};
+
+/* Background thread: defers slow blur/image-decode so the window appears
+ * immediately after grab. Sets bg_ready=true then calls redraw_screen(). */
+static void *bg_load_thread(void *arg) {
+    struct bg_load_args *args = (struct bg_load_args *)arg;
+
+    if (args->image_path != NULL) {
+        cairo_surface_t *loaded = load_image(args->image_path);
+        free(args->image_path);
+        /* img is written once here and read in render_lock() which runs under
+         * redraw_mutex. Writing before redraw_screen() ensures visibility. */
+        img = loaded;
+    }
+
+    if (args->do_blur && blur_bg_img != NULL) {
+        blur_image_surface(blur_bg_img, blur_sigma);
+    }
+
+    /* Signal render_lock() that blur_bg_img is safe to use */
+    bg_ready = true;
+
+    free(args);
+    redraw_screen();
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     struct passwd *pw;
     char *username;
@@ -2776,20 +2809,31 @@ int main(int argc, char *argv[]) {
                                  (uint32_t[]){XCB_EVENT_MASK_STRUCTURE_NOTIFY});
 
     init_colors_once();
+
+    /* Determine what the background thread needs to do */
+    bool async_image = false;
+    char *async_image_path = NULL;
+
     if (image_path != NULL) {
         if (!is_directory(image_path)) {
-            img = load_image(image_path);
+            /* Single image: defer load to background thread */
+            async_image = true;
+            async_image_path = image_path; /* thread will free it */
+            image_path = NULL;
         } else {
-            /* Path to a directory is provided -> use slideshow mode */
+            /* Slideshow: load synchronously (complex multi-image state) */
             slideshow_path = strdup(image_path);
             if (!load_slideshow_images(slideshow_path)) exit(EXIT_FAILURE);
             img = load_image(img_slideshow[0]);
+            free(image_path);
+            bg_ready = true; /* slideshow ready immediately */
         }
-        free(image_path);
     }
     free(image_raw_format);
 
     if (blur) {
+        /* Capture screen pixels NOW (before our window covers them).
+         * Only the blur computation is deferred to the background thread. */
         xcb_pixmap_t bg_pixmap = capture_bg_pixmap(conn, screen, last_resolution);
         cairo_surface_t *xcb_img = cairo_xcb_surface_create(conn, bg_pixmap, get_root_visual_type(screen), last_resolution[0], last_resolution[1]);
 
@@ -2798,11 +2842,14 @@ int main(int argc, char *argv[]) {
 
         cairo_set_source_surface(ctx, xcb_img, 0, 0);
         cairo_paint(ctx);
-        blur_image_surface(blur_bg_img, blur_sigma);
+        /* blur_image_surface() deferred to bg_load_thread */
 
         cairo_destroy(ctx);
         cairo_surface_destroy(xcb_img);
         xcb_free_pixmap(conn, bg_pixmap);
+    } else if (!async_image) {
+        /* No blur, no async image: nothing to defer, mark ready now */
+        bg_ready = true;
     }
 
     xcb_window_t stolen_focus = find_focused_window(conn, screen->root);
@@ -2854,6 +2901,29 @@ int main(int argc, char *argv[]) {
      * we should get all key presses/releases due to having grabbed the
      * keyboard. */
     (void)load_keymap();
+
+    /* Spawn background thread to finish slow work (blur computation / image
+     * decode) now that the window is visible and input is grabbed. */
+    if (async_image || blur) {
+        struct bg_load_args *bg_args = calloc(1, sizeof(struct bg_load_args));
+        bg_args->image_path = async_image_path; /* NULL if no async image */
+        bg_args->do_blur = blur;
+        pthread_t bg_thread;
+        if (pthread_create(&bg_thread, NULL, bg_load_thread, bg_args) == 0) {
+            pthread_detach(bg_thread);
+        } else {
+            /* Thread creation failed: do the work synchronously */
+            if (async_image_path != NULL) {
+                img = load_image(async_image_path);
+                free(async_image_path);
+            }
+            if (blur && blur_bg_img != NULL) {
+                blur_image_surface(blur_bg_img, blur_sigma);
+            }
+            bg_ready = true;
+            free(bg_args);
+        }
+    }
 
     /* Initialize the libev event loop. */
     main_loop = EV_DEFAULT;

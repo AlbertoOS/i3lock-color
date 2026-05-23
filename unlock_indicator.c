@@ -106,6 +106,7 @@ extern char *image_path;
 extern char *slideshow_path;
 extern char *img_slideshow[256];
 extern cairo_surface_t *blur_bg_img;
+extern volatile bool bg_ready;
 extern int slideshow_image_count;
 extern int slideshow_interval;
 extern bool slideshow_random_selection;
@@ -848,7 +849,7 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         }
     }
 
-    if (blur_bg_img) {
+    if (blur_bg_img && bg_ready) {
         cairo_set_source_surface(xcb_ctx, blur_bg_img, 0, 0);
         cairo_paint(xcb_ctx);
     } else {
