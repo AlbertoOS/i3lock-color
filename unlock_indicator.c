@@ -359,7 +359,9 @@ static cairo_font_face_t *get_font_face(int which) {
     cairo_font_face_t *face = cairo_ft_font_face_create_for_pattern(pattern_ready);
     FcPatternDestroy(pattern_ready);
     font_faces[which] = cairo_font_face_reference(face);
-    FcFini();
+    /* FcFini() deliberately NOT called: it would release all fontconfig resources,
+     * breaking subsequent font face loads. FcInit() is idempotent and safe to call
+     * repeatedly; fontconfig state persists for the lifetime of the process. */
     return face;
 }
 
