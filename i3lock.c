@@ -1849,8 +1849,6 @@ static void *bg_load_thread(void *arg) {
     if (args->image_path != NULL) {
         cairo_surface_t *loaded = load_image(args->image_path);
         free(args->image_path);
-        /* img is written once here and read in render_lock() which runs under
-         * redraw_mutex. Writing before redraw_screen() ensures visibility. */
         img = loaded;
     }
 
@@ -1858,8 +1856,18 @@ static void *bg_load_thread(void *arg) {
         blur_image_surface(blur_bg_img, blur_sigma, blur_scale);
     }
 
-    /* Signal render_lock() that blur_bg_img is safe to use */
+    /* Full memory barrier: ensure img and blur_bg_img writes are visible to
+     * all threads before bg_ready becomes true. Without this, the main thread
+     * could observe bg_ready=true but still see img=NULL (store reordering). */
+    __sync_synchronize();
+
+    /* Signal render_lock() that the background is ready to use */
     bg_ready = true;
+
+    /* Invalidate any bg_cache that was populated before the image/blur was
+     * ready (e.g. a clock-tick redraw that ran during async load would have
+     * cached the solid-color fallback). Force a full re-composite now. */
+    invalidate_bg_cache();
 
     free(args);
     redraw_screen();
@@ -1884,7 +1892,7 @@ int main(int argc, char *argv[]) {
         {"color", required_argument, NULL, 'c'},
         {"pointer", required_argument, NULL, 'p'},
         {"debug", no_argument, NULL, 999},
-        {"help", no_argument, NULL, 'h'},
+        {"help", no_argument, NULL, 908},
         {"no-unlock-indicator", no_argument, NULL, 'u'},
         {"image", required_argument, NULL, 'i'},
         {"raw", required_argument, NULL, 998},
@@ -2752,6 +2760,19 @@ int main(int argc, char *argv[]) {
             case 999:
                 debug_mode = true;
                 break;
+            case 908:
+                /* --help: show full man page via man(1), fall back to synopsis */
+                if (system("man i3lock 2>/dev/null") != 0) {
+                    printf("Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
+                           " [-i image.png] [-t] [-e] [-f]\n"
+                           "Please see the manpage for a full list of arguments.\n");
+                }
+                exit(EXIT_SUCCESS);
+            case 'h':
+                printf("Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
+                       " [-i image.png] [-t] [-e] [-f]\n"
+                       "Please see the manpage for a full list of arguments.\n");
+                exit(EXIT_SUCCESS);
             default:
                 errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
                                    " [-i image.png] [-t] [-e] [-f]\n"
