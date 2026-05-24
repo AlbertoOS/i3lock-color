@@ -2649,6 +2649,10 @@ int main(int argc, char *argv[]) {
                         bar_bidirectional = true;
                         break;
                     case BAR_DEFAULT:
+                    default:
+                        break;
+                }
+                break;
             case 906:
                 blur_scale = atoi(optarg);
                 if (blur_scale < 1) blur_scale = 1;
@@ -2657,10 +2661,6 @@ int main(int argc, char *argv[]) {
             case 907:
                 ind_blur_radius = atoi(optarg);
                 if (ind_blur_radius < 0) ind_blur_radius = 0;
-                break;
-            default:
-                        break;
-                }
                 break;
             case 703:
                 arg = optarg;
