@@ -212,6 +212,8 @@ int blur_sigma = 5;
 static int blur_scale = 1;
 int ind_blur_radius = 0;
 
+double key_flash_duration = 0.5; /* seconds the key-active ring highlight stays lit */
+
 /* do not verify password */
 bool no_verify = false;
 
@@ -1069,7 +1071,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
         pending_redraw_mode = REDRAW_PARTIAL;
 
         struct ev_timer *timeout = NULL;
-        START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
+        START_TIMER(timeout, key_flash_duration, redraw_timeout);
         STOP_TIMER(clear_indicator_timeout);
     }
 
@@ -1908,6 +1910,7 @@ int main(int argc, char *argv[]) {
         {"blur", required_argument, NULL, 'B'},
         {"blur-scale", required_argument, NULL, 906},
         {"ind-blur-radius", required_argument, NULL, 907},
+        {"key-flash-duration", required_argument, NULL, 909},
 
         // options for unlock indicator colors
         {"insidever-color", required_argument, NULL, 300},
@@ -2669,6 +2672,11 @@ int main(int argc, char *argv[]) {
             case 907:
                 ind_blur_radius = atoi(optarg);
                 if (ind_blur_radius < 0) ind_blur_radius = 0;
+                break;
+            case 909:
+                key_flash_duration = atof(optarg);
+                if (key_flash_duration < 0.05) key_flash_duration = 0.05; /* minimum 50ms */
+                if (key_flash_duration > 5.0)  key_flash_duration = 5.0;  /* maximum 5s */
                 break;
             case 703:
                 arg = optarg;
