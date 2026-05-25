@@ -1498,27 +1498,19 @@ void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ct
     double image_width = cairo_image_surface_get_width(img);
     double image_height = cairo_image_surface_get_height(img);
 
-    const double scaling_factor = get_dpi_value() / 96.0;
-
     for (int i = 0; i < xr_screens; i++) {
-        // Scale logical→physical for HiDPI
-        double screen_w = xr_resolutions[i].width  * scaling_factor;
-        double screen_h = xr_resolutions[i].height * scaling_factor;
-        double screen_x = xr_resolutions[i].x      * scaling_factor;
-        double screen_y = xr_resolutions[i].y      * scaling_factor;
-
         // Find out scaling factors using bg_type and aspect ratios
         double scale_x = 1, scale_y = 1;
         if (bg_type == SCALE) {
-            scale_x = screen_w / image_width;
-            scale_y = screen_h / image_height;
+            scale_x = xr_resolutions[i].width / image_width;
+            scale_y = xr_resolutions[i].height / image_height;
 
         } else if (bg_type == MAX || bg_type == FILL) {
-            double aspect_diff = screen_h / screen_w - image_height / image_width;
-            if((bg_type == MAX && aspect_diff >= 0) || (bg_type == FILL && aspect_diff <= 0)) {
-                scale_x = scale_y = screen_w / image_width;
+            double aspect_diff = (double)xr_resolutions[i].height / xr_resolutions[i].width - image_height / image_width;
+            if ((bg_type == MAX && aspect_diff >= 0) || (bg_type == FILL && aspect_diff <= 0)) {
+                scale_x = scale_y = xr_resolutions[i].width / image_width;
             } else if ((bg_type == MAX && aspect_diff < 0) || (bg_type == FILL && aspect_diff > 0)) {
-                scale_x = scale_y = screen_h / image_height;
+                scale_x = scale_y = xr_resolutions[i].height / image_height;
             }
         }
 
@@ -1528,18 +1520,18 @@ void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ct
 
         if (bg_type == TILE) {
             // Start image from top-left corner
-            cairo_matrix_translate(&matrix, -screen_x, -screen_y);
+            cairo_matrix_translate(&matrix, -xr_resolutions[i].x, -xr_resolutions[i].y);
         } else {
             // Draw image in the center of the screen
             cairo_matrix_translate(&matrix,
-                (image_width  * scale_x - screen_w) / 2 - screen_x,
-                (image_height * scale_y - screen_h) / 2 - screen_y);
+                (image_width  * scale_x - xr_resolutions[i].width ) / 2 - xr_resolutions[i].x,
+                (image_height * scale_y - xr_resolutions[i].height) / 2 - xr_resolutions[i].y);
         }
 
         cairo_pattern_set_matrix(pattern, &matrix);
 
         // Draw to screen
-        cairo_rectangle(xcb_ctx, screen_x, screen_y, screen_w, screen_h);
+        cairo_rectangle(xcb_ctx, xr_resolutions[i].x, xr_resolutions[i].y, xr_resolutions[i].width, xr_resolutions[i].height);
         cairo_fill(xcb_ctx);
     }
 
