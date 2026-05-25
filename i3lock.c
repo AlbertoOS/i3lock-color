@@ -19,6 +19,7 @@
 #include <pwd.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -38,6 +39,9 @@
 #include <string.h>
 #include <ev.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <xkbcommon/xkbcommon.h>
 #if XKBCOMPOSE == 1
 #include <xkbcommon/xkbcommon-compose.h>
@@ -205,6 +209,10 @@ char* greeter_text = "";
 bool blur = false;
 bool step_blur = false;
 int blur_sigma = 5;
+static int blur_scale = 1;
+int ind_blur_radius = 0;
+
+double key_flash_duration = 0.5; /* seconds the key-active ring highlight stays lit */
 
 /* do not verify password */
 bool no_verify = false;
@@ -260,6 +268,8 @@ int gif_img_count = 0;
 cairo_surface_t *img = NULL;
 char *img_slideshow[256];
 cairo_surface_t *blur_bg_img = NULL;
+/* Set to true by the background load thread once blur/image is ready to draw */
+volatile bool bg_ready = false;
 int slideshow_image_count = 0;
 int slideshow_interval = 10;
 bool slideshow_random_selection = false;
@@ -297,6 +307,14 @@ pthread_t draw_thread;
 // main thread still sometimes calls redraw()
 // allow you to disable. handy if you use bar with lots of crap.
 bool redraw_thread = false;
+static bool redraw_needed = false;
+extern redraw_mode_t pending_redraw_mode;
+
+/* Condvar-based render thread (--redraw-thread) */
+pthread_mutex_t render_cond_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  render_cond       = PTHREAD_COND_INITIALIZER;
+volatile bool   render_pending    = false;
+volatile bool   render_shutdown   = false;
 
 // experimental bar stuff
 #define BAR_VERT 0
@@ -488,7 +506,7 @@ static void clear_password_memory(void) {
 #ifdef HAVE_EXPLICIT_BZERO
     /* Use explicit_bzero(3) which was explicitly designed not to be
      * optimized out by the compiler. */
-    explicit_bzero(password, strlen(password));
+    explicit_bzero(password, sizeof(password));
 #else
     /* A volatile pointer to the password buffer to prevent the compiler from
      * optimizing this out. */
@@ -587,6 +605,7 @@ static void input_done(void) {
     redraw_screen();
 
     if (no_verify) {
+        fprintf(stderr, "WARNING: --no-verify is active — screen is NOT secured, any key unlocks\n");
         ev_break(EV_DEFAULT, EVBREAK_ALL);
         return;
     }
@@ -684,8 +703,38 @@ static void input_done(void) {
 }
 
 static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
+    if (unlock_state == STATE_KEY_ACTIVE || unlock_state == STATE_BACKSPACE_ACTIVE)
+        unlock_state = STATE_KEY_PRESSED;
     redraw_screen();
     STOP_TIMER(w);
+}
+
+static void *render_thread_func(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&render_cond_mutex);
+    while (!render_shutdown) {
+        while (!render_pending && !render_shutdown)
+            pthread_cond_wait(&render_cond, &render_cond_mutex);
+        if (render_shutdown)
+            break;
+        render_pending = false;
+        pthread_mutex_unlock(&render_cond_mutex);
+        redraw_screen();
+        pthread_mutex_lock(&render_cond_mutex);
+    }
+    pthread_mutex_unlock(&render_cond_mutex);
+    return NULL;
+}
+
+static void request_redraw(void) {
+    if (redraw_thread) {
+        pthread_mutex_lock(&render_cond_mutex);
+        render_pending = true;
+        pthread_cond_signal(&render_cond);
+        pthread_mutex_unlock(&render_cond_mutex);
+    } else {
+        redraw_screen();
+    }
 }
 
 static bool skip_without_validation(void) {
@@ -696,6 +745,35 @@ static bool skip_without_validation(void) {
         return true;
 
     return false;
+}
+
+/*
+ * Executes @cmd via "/bin/sh -c" using a double-fork so that the child is
+ * immediately reparented to init and does not become a zombie.  Avoids the
+ * shell-injection risk of system(3) (which inherits SIGCHLD disposition and
+ * blocked signals from the caller) and does not block the event loop.
+ */
+static void exec_cmd(const char *cmd) {
+    if (!cmd || !*cmd)
+        return;
+    pid_t pid = fork();
+    if (pid < 0)
+        return;
+    if (pid == 0) {
+        /* First child: fork again so grandchild is re-parented to init */
+        pid_t pid2 = fork();
+        if (pid2 < 0)
+            _exit(1);
+        if (pid2 == 0) {
+            /* Grandchild: exec the command */
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        }
+        /* First child exits immediately, leaving grandchild to init */
+        _exit(0);
+    }
+    /* Parent: reap the first child (exits instantly) */
+    waitpid(pid, NULL, 0);
 }
 
 /*
@@ -751,85 +829,85 @@ static void handle_key_press(xcb_key_press_event_t *event) {
         switch(ksym) {
             case XKB_KEY_XF86MonBrightnessUp:
                 if (cmd_brightness_up) {
-                    system(cmd_brightness_up);
+                    exec_cmd(cmd_brightness_up);
                     return;
                 }
                 break;
             case XKB_KEY_XF86MonBrightnessDown:
                 if (cmd_brightness_down) {
-                    system(cmd_brightness_down);
+                    exec_cmd(cmd_brightness_down);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioPlay:
                 if (cmd_media_play) {
-                    system(cmd_media_play);
+                    exec_cmd(cmd_media_play);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioPause:
                 if (cmd_media_pause) {
-                    system(cmd_media_pause);
+                    exec_cmd(cmd_media_pause);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioStop:
                 if (cmd_media_stop) {
-                    system(cmd_media_stop);
+                    exec_cmd(cmd_media_stop);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioPrev:
                 if (cmd_media_prev) {
-                    system(cmd_media_prev);
+                    exec_cmd(cmd_media_prev);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioNext:
                 if (cmd_media_next) {
-                    system(cmd_media_next);
+                    exec_cmd(cmd_media_next);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioMute:
                 if (cmd_audio_mute) {
-                    system(cmd_audio_mute);
+                    exec_cmd(cmd_audio_mute);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioLowerVolume:
                 if (cmd_volume_down) {
-                    system(cmd_volume_down);
+                    exec_cmd(cmd_volume_down);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioRaiseVolume:
                 if (cmd_volume_up) {
-                    system(cmd_volume_up);
+                    exec_cmd(cmd_volume_up);
                     return;
                 }
                 break;
             case XKB_KEY_XF86AudioMicMute:
                 if (cmd_mic_mute) {
-                    system(cmd_mic_mute);
+                    exec_cmd(cmd_mic_mute);
                     return;
                 }
                 break;
             case XKB_KEY_XF86PowerDown:
                 if (cmd_power_down) {
-                    system(cmd_power_down);
+                    exec_cmd(cmd_power_down);
                     return;
                 }
                 break;
             case XKB_KEY_XF86PowerOff:
                 if (cmd_power_off) {
-                    system(cmd_power_off);
+                    exec_cmd(cmd_power_off);
                     return;
                 }
                 break;
             case XKB_KEY_XF86Sleep:
                 if (cmd_power_sleep) {
-                    system(cmd_power_sleep);
+                    exec_cmd(cmd_power_sleep);
                     return;
                 }
                 break;
@@ -960,8 +1038,8 @@ static void handle_key_press(xcb_key_press_event_t *event) {
              * empty. */
             START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
             unlock_state = STATE_BACKSPACE_ACTIVE;
-            redraw_screen();
-            unlock_state = STATE_KEY_PRESSED;
+            redraw_needed = true;
+            pending_redraw_mode = REDRAW_PARTIAL;
             return;
     }
 
@@ -985,15 +1063,15 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     /* store it in the password array as UTF-8 */
     memcpy(password + input_position, buffer, n - 1);
     input_position += n - 1;
-    DEBUG("current password = %.*s\n", input_position, password);
+    DEBUG("password length = %d\n", input_position);
 
     if (unlock_indicator) {
         unlock_state = STATE_KEY_ACTIVE;
-        redraw_screen();
-        unlock_state = STATE_KEY_PRESSED;
+        redraw_needed = true;
+        pending_redraw_mode = REDRAW_PARTIAL;
 
         struct ev_timer *timeout = NULL;
-        START_TIMER(timeout, TSTAMP_N_SECS(0.25), redraw_timeout);
+        START_TIMER(timeout, key_flash_duration, redraw_timeout);
         STOP_TIMER(clear_indicator_timeout);
     }
 
@@ -1100,6 +1178,8 @@ static void handle_screen_resize(void) {
     last_resolution[1] = geom->height;
 
     free(geom);
+
+    invalidate_bg_cache();
 
     redraw_screen();
 
@@ -1243,7 +1323,7 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
         int img_bottom = img_top + pimg->ImageDesc.Height;
 
         /* Handle disposal mode */
-        int data_size = width * height * ((int)sizeof(width));
+        int data_size = width * height * ((int)sizeof(uint32_t));
         switch (gc.DisposalMode) {
             case DISPOSE_DO_NOT:
                 if (data_prev) {
@@ -1252,9 +1332,12 @@ static cairo_surface_t *read_gif_image(const char *image_path) {
                     memset(data, 0, data_size);
                 }
                 break;
-            case DISPOSE_BACKGROUND:
-                memset(data, bg_color, data_size);
+            case DISPOSE_BACKGROUND: {
+                uint32_t *pixels = data;
+                for (int i = 0; i < width * height; i++)
+                    pixels[i] = bg_color;
                 break;
+            }
             default:
                 memset(data, 0, data_size);
         }
@@ -1588,6 +1671,13 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
 
         free(event);
     }
+
+    /* Coalesced redraw: drain all pending XCB events first, then redraw once.
+     * Typing 5 keys in 20ms triggers 1 redraw instead of 5. */
+    if (redraw_needed) {
+        redraw_needed = false;
+        request_redraw();
+    }
 }
 
 /*
@@ -1646,24 +1736,26 @@ static void raise_loop(xcb_window_t window) {
 }
 
 /*
- * Loads an image from the given path. Handles JPEG and PNG. Returns NULL in case of error.
+ * Loads an image from the given path. Detects format automatically.
+ * Returns NULL on error or unsupported format.
  */
-cairo_surface_t *load_image(enum IMAGE_FORMAT format) {
+cairo_surface_t *load_image(const char *path) {
     cairo_surface_t *img = NULL;
     JPEG_INFO jpg_info;
     unsigned char *jpg_data;
+    enum IMAGE_FORMAT format = verify_image(path);
 
     switch (format) {
         case IMAGE_FORMAT_RAW:
             /* Read image. 'read_raw_image' returns NULL on error,
              * so we don't have to handle errors here. */
-            img = read_raw_image(image_path, image_raw_format);
+            img = read_raw_image(path, image_raw_format);
             break;
         case IMAGE_FORMAT_PNG:
-            img = cairo_image_surface_create_from_png(image_path);
+            img = cairo_image_surface_create_from_png(path);
             break;
         case IMAGE_FORMAT_JPG:
-            jpg_data = read_JPEG_file(image_path, &jpg_info);
+            jpg_data = read_JPEG_file(path, &jpg_info);
             if (jpg_data != NULL) {
                 img = cairo_image_surface_create_for_data(jpg_data,
                                                           CAIRO_FORMAT_ARGB32, jpg_info.width, jpg_info.height,
@@ -1671,10 +1763,10 @@ cairo_surface_t *load_image(enum IMAGE_FORMAT format) {
             }
             break;
         case IMAGE_FORMAT_GIF:
-            img = read_gif_image(image_path);
+            img = read_gif_image(path);
             break;
         default:
-            fprintf(stderr, "Unsupported image file format: %s\n", image_path);
+            fprintf(stderr, "Unsupported image file format: %s\n", path);
     }
 
     /* In case loading failed, we just pretend no -i was specified. */
@@ -1718,10 +1810,8 @@ bool load_slideshow_images(const char *path) {
         int result = regexec(&reg, dir->d_name, 0, NULL, 0);
         if (result) continue;
 
-        char path_to_image[256];
-        strcpy(path_to_image, path);
-        strcat(path_to_image, "/");
-        strcat(path_to_image, dir->d_name);
+        char path_to_image[PATH_MAX];
+        snprintf(path_to_image, sizeof(path_to_image), "%s/%s", path, dir->d_name);
 
         img_slideshow[file_count] = strdup(path_to_image);
 
@@ -1747,6 +1837,45 @@ void gif_anim_loop(struct ev_loop *loop, struct ev_timer *timer, int delay) {
     ev_timer_start(loop, timer);
 }
 
+/* Arguments for the background load thread */
+struct bg_load_args {
+    char *image_path; /* non-NULL: load this single image into img */
+    bool do_blur;     /* true: blur blur_bg_img (pixels already captured) */
+};
+
+/* Background thread: defers slow blur/image-decode so the window appears
+ * immediately after grab. Sets bg_ready=true then calls redraw_screen(). */
+static void *bg_load_thread(void *arg) {
+    struct bg_load_args *args = (struct bg_load_args *)arg;
+
+    if (args->image_path != NULL) {
+        cairo_surface_t *loaded = load_image(args->image_path);
+        free(args->image_path);
+        img = loaded;
+    }
+
+    if (args->do_blur && blur_bg_img != NULL) {
+        blur_image_surface(blur_bg_img, blur_sigma, blur_scale);
+    }
+
+    /* Full memory barrier: ensure img and blur_bg_img writes are visible to
+     * all threads before bg_ready becomes true. Without this, the main thread
+     * could observe bg_ready=true but still see img=NULL (store reordering). */
+    __sync_synchronize();
+
+    /* Signal render_lock() that the background is ready to use */
+    bg_ready = true;
+
+    /* Invalidate any bg_cache that was populated before the image/blur was
+     * ready (e.g. a clock-tick redraw that ran during async load would have
+     * cached the solid-color fallback). Force a full re-composite now. */
+    invalidate_bg_cache();
+
+    free(args);
+    redraw_screen();
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     struct passwd *pw;
     char *username;
@@ -1765,7 +1894,7 @@ int main(int argc, char *argv[]) {
         {"color", required_argument, NULL, 'c'},
         {"pointer", required_argument, NULL, 'p'},
         {"debug", no_argument, NULL, 999},
-        {"help", no_argument, NULL, 'h'},
+        {"help", no_argument, NULL, 908},
         {"no-unlock-indicator", no_argument, NULL, 'u'},
         {"image", required_argument, NULL, 'i'},
         {"raw", required_argument, NULL, 998},
@@ -1779,6 +1908,9 @@ int main(int argc, char *argv[]) {
         {"show-failed-attempts", no_argument, NULL, 'f'},
         {"screen", required_argument, NULL, 'S'},
         {"blur", required_argument, NULL, 'B'},
+        {"blur-scale", required_argument, NULL, 906},
+        {"ind-blur-radius", required_argument, NULL, 907},
+        {"key-flash-duration", required_argument, NULL, 909},
 
         // options for unlock indicator colors
         {"insidever-color", required_argument, NULL, 300},
@@ -2532,6 +2664,20 @@ int main(int argc, char *argv[]) {
                         break;
                 }
                 break;
+            case 906:
+                blur_scale = atoi(optarg);
+                if (blur_scale < 1) blur_scale = 1;
+                if (blur_scale > 8) blur_scale = 8;
+                break;
+            case 907:
+                ind_blur_radius = atoi(optarg);
+                if (ind_blur_radius < 0) ind_blur_radius = 0;
+                break;
+            case 909:
+                key_flash_duration = atof(optarg);
+                if (key_flash_duration < 0.05) key_flash_duration = 0.05; /* minimum 50ms */
+                if (key_flash_duration > 5.0)  key_flash_duration = 5.0;  /* maximum 5s */
+                break;
             case 703:
                 arg = optarg;
                 if (strcmp(arg, "vertical") == 0)
@@ -2622,6 +2768,19 @@ int main(int argc, char *argv[]) {
             case 999:
                 debug_mode = true;
                 break;
+            case 908:
+                /* --help: show full man page via man(1), fall back to synopsis */
+                if (system("man i3lock 2>/dev/null") != 0) {
+                    printf("Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
+                           " [-i image.png] [-t] [-e] [-f]\n"
+                           "Please see the manpage for a full list of arguments.\n");
+                }
+                exit(EXIT_SUCCESS);
+            case 'h':
+                printf("Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
+                       " [-i image.png] [-t] [-e] [-f]\n"
+                       "Please see the manpage for a full list of arguments.\n");
+                exit(EXIT_SUCCESS);
             default:
                 errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
                                    " [-i image.png] [-t] [-e] [-f]\n"
@@ -2654,6 +2813,16 @@ int main(int argc, char *argv[]) {
     if (mlock(password, sizeof(password)) != 0)
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
 #endif
+
+    atexit(clear_password_memory);
+
+#if defined(__linux__)
+    /* Prevent core dumps — password buffer would be in cleartext */
+    prctl(PR_SET_DUMPABLE, 0);
+#endif
+    /* Belt-and-suspenders: also set RLIMIT_CORE to 0 */
+    struct rlimit core_limit = {0, 0};
+    setrlimit(RLIMIT_CORE, &core_limit);
 
     /* Double checking that connection is good and operatable with xcb */
     int screennr;
@@ -2741,22 +2910,31 @@ int main(int argc, char *argv[]) {
                                  (uint32_t[]){XCB_EVENT_MASK_STRUCTURE_NOTIFY});
 
     init_colors_once();
+
+    /* Determine what the background thread needs to do */
+    bool async_image = false;
+    char *async_image_path = NULL;
+
     if (image_path != NULL) {
         if (!is_directory(image_path)) {
-            enum IMAGE_FORMAT image_format = verify_image(image_path);
-            img = load_image(image_format);
+            /* Single image: defer load to background thread */
+            async_image = true;
+            async_image_path = image_path; /* thread will free it */
+            image_path = NULL;
         } else {
-            /* Path to a directory is provided -> use slideshow mode */
+            /* Slideshow: load synchronously (complex multi-image state) */
             slideshow_path = strdup(image_path);
             if (!load_slideshow_images(slideshow_path)) exit(EXIT_FAILURE);
-            enum IMAGE_FORMAT image_format = verify_image(img_slideshow[0]);
-            img = load_image(image_format);
+            img = load_image(img_slideshow[0]);
+            free(image_path);
+            bg_ready = true; /* slideshow ready immediately */
         }
-        free(image_path);
     }
     free(image_raw_format);
 
     if (blur) {
+        /* Capture screen pixels NOW (before our window covers them).
+         * Only the blur computation is deferred to the background thread. */
         xcb_pixmap_t bg_pixmap = capture_bg_pixmap(conn, screen, last_resolution);
         cairo_surface_t *xcb_img = cairo_xcb_surface_create(conn, bg_pixmap, get_root_visual_type(screen), last_resolution[0], last_resolution[1]);
 
@@ -2765,11 +2943,14 @@ int main(int argc, char *argv[]) {
 
         cairo_set_source_surface(ctx, xcb_img, 0, 0);
         cairo_paint(ctx);
-        blur_image_surface(blur_bg_img, blur_sigma);
+        /* blur_image_surface() deferred to bg_load_thread */
 
         cairo_destroy(ctx);
         cairo_surface_destroy(xcb_img);
         xcb_free_pixmap(conn, bg_pixmap);
+    } else if (!async_image) {
+        /* No blur, no async image: nothing to defer, mark ready now */
+        bg_ready = true;
     }
 
     xcb_window_t stolen_focus = find_focused_window(conn, screen->root);
@@ -2822,6 +3003,29 @@ int main(int argc, char *argv[]) {
      * keyboard. */
     (void)load_keymap();
 
+    /* Spawn background thread to finish slow work (blur computation / image
+     * decode) now that the window is visible and input is grabbed. */
+    if (async_image || blur) {
+        struct bg_load_args *bg_args = calloc(1, sizeof(struct bg_load_args));
+        bg_args->image_path = async_image_path; /* NULL if no async image */
+        bg_args->do_blur = blur;
+        pthread_t bg_thread;
+        if (pthread_create(&bg_thread, NULL, bg_load_thread, bg_args) == 0) {
+            pthread_detach(bg_thread);
+        } else {
+            /* Thread creation failed: do the work synchronously */
+            if (async_image_path != NULL) {
+                img = load_image(async_image_path);
+                free(async_image_path);
+            }
+            if (blur && blur_bg_img != NULL) {
+                blur_image_surface(blur_bg_img, blur_sigma, blur_scale);
+            }
+            bg_ready = true;
+            free(bg_args);
+        }
+    }
+
     /* Initialize the libev event loop. */
     main_loop = EV_DEFAULT;
     if (main_loop == NULL)
@@ -2856,18 +3060,20 @@ int main(int argc, char *argv[]) {
     ev_invoke(main_loop, xcb_check, 0);
 
     if (show_clock || bar_enabled || slideshow_enabled) {
-        if (redraw_thread) {
-            struct timespec ts;
-            double s;
-            double ns = modf(refresh_rate, &s);
-            ts.tv_sec = (time_t) s;
-            ts.tv_nsec = ns * NANOSECONDS_IN_SECOND;
-            (void) pthread_create(&draw_thread, NULL, start_time_redraw_tick_pthread, (void*) &ts);
-        } else {
-            start_time_redraw_tick(main_loop);
-        }
+        start_time_redraw_tick(main_loop);
+    }
+    if (redraw_thread) {
+        (void)pthread_create(&draw_thread, NULL, render_thread_func, NULL);
     }
     ev_loop(main_loop, 0);
+
+    if (redraw_thread) {
+        pthread_mutex_lock(&render_cond_mutex);
+        render_shutdown = true;
+        pthread_cond_signal(&render_cond);
+        pthread_mutex_unlock(&render_cond_mutex);
+        pthread_join(draw_thread, NULL);
+    }
 
 #ifndef __OpenBSD__
     if (pam_cleanup) {

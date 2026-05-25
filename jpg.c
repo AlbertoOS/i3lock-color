@@ -34,7 +34,7 @@ bool file_is_jpg(FILE* image_file) {
  * Reads a JPEG from a file into memory, in a format that Cairo can create a
  * surface from.
  */
-void* read_JPEG_file(char *file_path, JPEG_INFO *jpg_info) {
+void *read_JPEG_file(const char *file_path, JPEG_INFO *jpg_info) {
     int img_err;
     struct jpeg_decompress_struct cinfo;
     struct jpeg_error_mgr jerr;

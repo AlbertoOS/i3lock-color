@@ -268,7 +268,7 @@ void _xinerama_query_screens(void) {
         return;
     }
 
-    for (int screen = 0; screen < xr_screens; screen++) {
+    for (int screen = 0; screen < screens; screen++) {
         resolutions[screen].x = screen_info[screen].x_org;
         resolutions[screen].y = screen_info[screen].y_org;
         resolutions[screen].width = screen_info[screen].width;

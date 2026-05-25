@@ -5,5 +5,4 @@
 # which doesn't work on Arch and Gentoo.
 #
 
-#auth include system-local-login # For Arch/Gentoo
-auth include login # For Debian
+@PAM_AUTH_LINE@

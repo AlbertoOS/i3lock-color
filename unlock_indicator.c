@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 #include <xcb/xcb.h>
 #include <xcb/randr.h>
 #include <ev.h>
@@ -26,9 +27,11 @@
 #include "dpi.h"
 #include "tinyexpr.h"
 #include "fonts.h"
+#include "blur.h"
 
 /* clock stuff */
 #include <time.h>
+#include <pthread.h>
 
 extern double circle_radius;
 extern double ring_width;
@@ -37,6 +40,45 @@ extern double ring_width;
 #define RING_WIDTH (ring_width)
 #define BUTTON_SPACE (BUTTON_RADIUS + (RING_WIDTH / 2))
 #define BUTTON_DIAMETER (2 * BUTTON_SPACE)
+
+/*
+ * Cached tinyexpr state for render_lock().
+ *
+ * Expressions are compiled once on the first call to render_lock() and
+ * reused on every subsequent call (every keypress, clock tick, etc.).
+ * The te_variable array points to file-scope doubles that are updated
+ * before each te_eval() call, so the cached expressions always see the
+ * correct per-screen values.
+ */
+static double te_var_w, te_var_h, te_var_x, te_var_y;
+static double te_var_ix, te_var_iy, te_var_tx, te_var_ty;
+static double te_var_dx, te_var_dy, te_var_bw, te_var_bx, te_var_by, te_var_r;
+
+/* clang-format off */
+static te_variable te_cached_vars[14] = {
+    {"w",  &te_var_w},  {"h",  &te_var_h},
+    {"x",  &te_var_x},  {"y",  &te_var_y},
+    {"ix", &te_var_ix}, {"iy", &te_var_iy},
+    {"tx", &te_var_tx}, {"ty", &te_var_ty},
+    {"dx", &te_var_dx}, {"dy", &te_var_dy},
+    {"bw", &te_var_bw}, {"bx", &te_var_bx},
+    {"by", &te_var_by}, {"r",  &te_var_r},
+};
+/* clang-format on */
+
+static te_expr *te_cached_ind_x = NULL, *te_cached_ind_y = NULL;
+static te_expr *te_cached_time_x = NULL, *te_cached_time_y = NULL;
+static te_expr *te_cached_date_x = NULL, *te_cached_date_y = NULL;
+static te_expr *te_cached_layout_x = NULL, *te_cached_layout_y = NULL;
+static te_expr *te_cached_status_x = NULL, *te_cached_status_y = NULL;
+static te_expr *te_cached_verif_x = NULL, *te_cached_verif_y = NULL;
+static te_expr *te_cached_wrong_x = NULL, *te_cached_wrong_y = NULL;
+static te_expr *te_cached_modif_x = NULL, *te_cached_modif_y = NULL;
+static te_expr *te_cached_bar_x = NULL;
+static te_expr *te_cached_bar_y = NULL;     /* NULL when bar_y_expr is empty */
+static te_expr *te_cached_bar_width = NULL; /* NULL when bar_width_expr is empty */
+static te_expr *te_cached_greeter_x = NULL, *te_cached_greeter_y = NULL;
+static bool te_exprs_compiled = false;
 
 /*******************************************************************************
  * Variables defined in i3lock.c.
@@ -66,7 +108,9 @@ extern char *image_path;
 extern char *slideshow_path;
 extern char *img_slideshow[256];
 extern cairo_surface_t *blur_bg_img;
+extern volatile bool bg_ready;
 extern int slideshow_image_count;
+extern int gif_img_count;
 extern int slideshow_interval;
 extern bool slideshow_random_selection;
 int slideshow_image_now = 0;
@@ -165,12 +209,21 @@ extern char *layout_text;
 extern char *greeter_text;
 
 bool load_slideshow_images(const char *path);
-cairo_surface_t* load_image(char* image_path);
+cairo_surface_t *load_image(const char *path);
 
 /* Whether the failed attempts should be displayed. */
 extern bool show_failed_attempts;
 /* Number of failed unlock attempts. */
 extern int failed_attempts;
+/* Whether password verification is disabled (--no-verify). */
+extern bool no_verify;
+/* Whether --redraw-thread is active. */
+extern bool redraw_thread;
+extern pthread_mutex_t render_cond_mutex;
+extern pthread_cond_t  render_cond;
+extern volatile bool   render_pending;
+/* Indicator blur radius (--ind-blur-radius). */
+extern int ind_blur_radius;
 
 /*******************************************************************************
  * Variables defined in xcb.c.
@@ -190,6 +243,41 @@ static struct ev_periodic *time_redraw_tick;
 static xcb_visualtype_t *vistype;
 
 int current_slideshow_index = 0;
+
+/*******************************************************************************
+ * Background cache.
+ *
+ * The background (blur/solid color + image overlay) is expensive to composite
+ * but only changes on: initial bg_ready, slideshow frame change, GIF frame,
+ * or screen resize.  We cache it as a cairo image surface and blit it on
+ * subsequent render_lock() calls (every keypress / clock tick).
+ ******************************************************************************/
+static cairo_surface_t *bg_cache = NULL;
+static uint32_t bg_cache_w = 0, bg_cache_h = 0;
+static int bg_cache_slideshow_idx = -1;
+
+/* Persistent pixmap for redraw avoidance (Feature 2) */
+static xcb_pixmap_t persistent_pixmap = XCB_NONE;
+static uint32_t persistent_pix_w = 0, persistent_pix_h = 0;
+static xcb_pixmap_t bg_only_pixmap = XCB_NONE;
+static uint32_t bg_only_w = 0, bg_only_h = 0;
+static xcb_gcontext_t copy_gc = XCB_NONE;
+static double last_ind_x = 0, last_ind_y = 0;
+redraw_mode_t pending_redraw_mode = REDRAW_FULL;
+
+static xcb_gcontext_t get_copy_gc(void);
+static void partial_redraw_indicator(void);
+
+/*
+ * Invalidate the background cache.  Called from handle_screen_resize() (in
+ * i3lock.c) and internally when slideshow/GIF changes are detected.
+ */
+void invalidate_bg_cache(void) {
+    if (bg_cache) {
+        cairo_surface_destroy(bg_cache);
+        bg_cache = NULL;
+    }
+}
 
 /* Maintain the current unlock/PAM state to draw the appropriate unlock
  * indicator. */
@@ -320,7 +408,9 @@ static cairo_font_face_t *get_font_face(int which) {
     cairo_font_face_t *face = cairo_ft_font_face_create_for_pattern(pattern_ready);
     FcPatternDestroy(pattern_ready);
     font_faces[which] = cairo_font_face_reference(face);
-    FcFini();
+    /* FcFini() deliberately NOT called: it would release all fontconfig resources,
+     * breaking subsequent font face loads. FcInit() is idempotent and safe to call
+     * repeatedly; fontconfig state persists for the lifetime of the process. */
     return face;
 }
 
@@ -522,7 +612,7 @@ static void draw_bar(cairo_t *ctx, double bar_x, double bar_y, double bar_width,
 
 static void draw_indic(cairo_t *ctx, double ind_x, double ind_y) {
     if (unlock_indicator &&
-        (unlock_state >= STATE_KEY_PRESSED || auth_state > STATE_AUTH_IDLE || show_indicator)) {
+        (unlock_state >= STATE_KEY_PRESSED || auth_state > STATE_AUTH_IDLE || show_indicator || no_verify)) {
         /* Draw a (centered) circle with transparent background. */
         cairo_set_line_width(ctx, RING_WIDTH);
         cairo_arc(ctx, ind_x, ind_y, BUTTON_RADIUS, 0, 2 * M_PI);
@@ -590,6 +680,14 @@ static void draw_indic(cairo_t *ctx, double ind_x, double ind_y) {
                 break;
         }
         cairo_stroke(ctx);
+
+        /* --no-verify: override ring to bright red as a security warning */
+        if (no_verify) {
+            cairo_set_line_width(ctx, RING_WIDTH);
+            cairo_arc(ctx, ind_x, ind_y, BUTTON_RADIUS, 0, 2 * M_PI);
+            cairo_set_source_rgba(ctx, 1.0, 0.0, 0.0, 1.0);  /* bright red */
+            cairo_stroke(ctx);
+        }
 
         /* Draw an inner separator line. */
         if (internal_line_source != 2) {  //pretty sure this only needs drawn if it's being drawn over the inside?
@@ -779,19 +877,22 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
      * depending on the amount of screens) unlock indicators on.
      * create two more surfaces for time and date display
      */
-    cairo_surface_t *output = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, resolution[0], resolution[1]);
-    cairo_t *ctx = cairo_create(output);
+    cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, drawable, vistype, resolution[0], resolution[1]);
+    cairo_t *xcb_ctx = cairo_create(xcb_output);
+
+    /* Draw directly onto XCB surface — avoids 33MB intermediate surface
+     * and the full-screen OVER composite that dominated render time. */
+    cairo_t *ctx = xcb_ctx;
+    cairo_save(ctx);
     cairo_scale(ctx, scaling_factor, scaling_factor);
 
     //    cairo_set_font_face(ctx, get_font_face(0));
 
-    cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, drawable, vistype, resolution[0], resolution[1]);
-    cairo_t *xcb_ctx = cairo_create(xcb_output);
-
-    /*update image according to the slideshow_interval*/
+    /* --- Slideshow: advance frame if interval elapsed --- */
+    bool slideshow_changed = false;
     if (slideshow_image_count > 0) {
         unsigned long now = (unsigned long)time(NULL);
-        if (img == NULL || now - lastCheck >= slideshow_interval) {
+        if (img == NULL || now - lastCheck >= (unsigned long)slideshow_interval) {
             if (slideshow_random_selection) {
                 img = load_image(img_slideshow[rand() % slideshow_image_count]);
             } else {
@@ -803,20 +904,73 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
                 load_slideshow_images(slideshow_path);
             }
             lastCheck = now;
+            slideshow_changed = true;
         }
     }
 
-    if (blur_bg_img) {
-        cairo_set_source_surface(xcb_ctx, blur_bg_img, 0, 0);
-        cairo_paint(xcb_ctx);
-    } else {
-        cairo_set_source_rgba(xcb_ctx, background.red, background.green, background.blue, background.alpha);
-        cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
-        cairo_fill(xcb_ctx);
+    /* --- Background cache ---
+     * Cache the composited background (blur/color + image) as a client-side
+     * image surface. Invalidate when resolution, slideshow, or GIF changes.
+     * GIF mode: never cache (frame changes every tick).
+     * Before bg_ready: paint fallback without caching.
+     */
+    if (bg_cache != NULL &&
+        (bg_cache_w != resolution[0] || bg_cache_h != resolution[1] ||
+         slideshow_changed || gif_img_count > 0)) {
+        invalidate_bg_cache();
     }
 
-    if (img) {
-        draw_image(resolution, img, xcb_ctx);
+    if (bg_cache != NULL) {
+        /* FAST PATH: blit cached background.
+         * bg_cache is in physical pixels — paint without the logical scaling
+         * transform so it maps 1:1 onto the XCB surface. */
+        cairo_save(xcb_ctx);
+        cairo_identity_matrix(xcb_ctx);
+        cairo_set_source_surface(xcb_ctx, bg_cache, 0, 0);
+        cairo_paint(xcb_ctx);
+        cairo_restore(xcb_ctx);
+    } else {
+        /* SLOW PATH: composite background from scratch */
+        /* Use a temporary image surface so we can cache without X round-trips */
+        cairo_surface_t *bg_surf = cairo_image_surface_create(
+            CAIRO_FORMAT_ARGB32, resolution[0], resolution[1]);
+        cairo_t *bg_ctx = cairo_create(bg_surf);
+
+        if (blur_bg_img && bg_ready) {
+            cairo_set_source_surface(bg_ctx, blur_bg_img, 0, 0);
+            cairo_paint(bg_ctx);
+        } else {
+            cairo_set_source_rgba(bg_ctx, background.red, background.green,
+                                  background.blue, background.alpha);
+            cairo_rectangle(bg_ctx, 0, 0, resolution[0], resolution[1]);
+            cairo_fill(bg_ctx);
+        }
+
+        if (img) {
+            draw_image(resolution, img, bg_ctx);
+        }
+
+        cairo_destroy(bg_ctx);
+
+        /* Blit the freshly-painted background to the XCB target.
+         * bg_surf is in physical pixels — paint without the logical scaling
+         * transform so it maps 1:1 onto the XCB surface. */
+        cairo_save(xcb_ctx);
+        cairo_identity_matrix(xcb_ctx);
+        cairo_set_source_surface(xcb_ctx, bg_surf, 0, 0);
+        cairo_paint(xcb_ctx);
+        cairo_restore(xcb_ctx);
+
+        /* Cache it for future frames (only if background is final) */
+        if (bg_ready && gif_img_count == 0) {
+            bg_cache = bg_surf; /* transfer ownership */
+            bg_cache_w = resolution[0];
+            bg_cache_h = resolution[1];
+            bg_cache_slideshow_idx = current_slideshow_index;
+            DEBUG("bg_cache populated (%ux%u)\n", bg_cache_w, bg_cache_h);
+        } else {
+            cairo_surface_destroy(bg_surf); /* transient, don't keep */
+        }
     }
 
     /*
@@ -903,6 +1057,18 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         }
     }
 
+    /* --no-verify: show UNSECURED warning in bright red */
+    if (no_verify) {
+        draw_data.status_text.show = true;
+        strncpy(draw_data.status_text.str, "UNSECURED", sizeof(draw_data.status_text.str) - 1);
+        draw_data.status_text.font = get_font_face(WRONG_FONT);
+        draw_data.status_text.color = (rgba_t){1.0, 0.0, 0.0, 1.0};  /* bright red */
+        draw_data.status_text.outline_color = (rgba_t){0.0, 0.0, 0.0, 0.0};
+        draw_data.status_text.size = verif_size > 0 ? verif_size : 28.0;
+        draw_data.status_text.outline_width = 0;
+        draw_data.status_text.align = verif_align;
+    }
+
     if (modifier_string) {
         draw_data.mod_text.show = true;
         strncpy(draw_data.mod_text.str, modifier_string, sizeof(draw_data.mod_text.str) - 1);
@@ -983,45 +1149,34 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
           scaling_factor, button_diameter_physical);
 
     // variable mapping for evaluating the clock position expression
-    const unsigned int vars_size = 14;
-    te_variable vars[] =
-        {{"w", &width},
-         {"h", &height},
-         {"x", &screen_x},
-         {"y", &screen_y},
-         {"ix", &draw_data.indicator_x},
-         {"iy", &draw_data.indicator_y},
-         {"tx", &draw_data.time_text.x},
-         {"ty", &draw_data.time_text.y},
-         {"dx", &draw_data.date_text.x},
-         {"dy", &draw_data.date_text.y},
-         {"bw", &draw_data.bar_width},
-         {"bx", &draw_data.bar_x},
-         {"by", &draw_data.bar_y},
-         {"r", &radius}};
-
-    te_expr *te_ind_x_expr = compile_expression("--indpos", ind_x_expr, vars, vars_size);
-    te_expr *te_ind_y_expr = compile_expression("--indpos", ind_y_expr, vars, vars_size);
-    te_expr *te_time_x_expr = compile_expression("--timepos", time_x_expr, vars, vars_size);
-    te_expr *te_time_y_expr = compile_expression("--timepos", time_y_expr, vars, vars_size);
-    te_expr *te_date_x_expr = compile_expression("--datepos", date_x_expr, vars, vars_size);
-    te_expr *te_date_y_expr = compile_expression("--datepos", date_y_expr, vars, vars_size);
-    te_expr *te_layout_x_expr = compile_expression("--layoutpos", layout_x_expr, vars, vars_size);
-    te_expr *te_layout_y_expr = compile_expression("--layoutpos", layout_y_expr, vars, vars_size);
-    te_expr *te_status_x_expr = compile_expression("--statuspos", status_x_expr, vars, vars_size);
-    te_expr *te_status_y_expr = compile_expression("--statuspos", status_y_expr, vars, vars_size);
-    te_expr *te_verif_x_expr = compile_expression("--verifpos", verif_x_expr, vars, vars_size);
-    te_expr *te_verif_y_expr = compile_expression("--verifpos", verif_y_expr, vars, vars_size);
-    te_expr *te_wrong_x_expr = compile_expression("--wrongpos", wrong_x_expr, vars, vars_size);
-    te_expr *te_wrong_y_expr = compile_expression("--wrongpos", wrong_y_expr, vars, vars_size);
-    te_expr *te_modif_x_expr = compile_expression("--modifpos", modif_x_expr, vars, vars_size);
-    te_expr *te_modif_y_expr = compile_expression("--modifpos", modif_y_expr, vars, vars_size);
-    te_expr *te_bar_x_expr = compile_expression("--bar-position", bar_x_expr, vars, vars_size);
-    te_expr *te_bar_y_expr = strlen(bar_y_expr) ? compile_expression("--bar-position", bar_y_expr, vars, vars_size) : NULL;
-    te_expr *te_bar_width_expr = strlen(bar_width_expr) ? compile_expression("--bar-width", bar_width_expr, vars, vars_size) : NULL;
-
-    te_expr *te_greeter_x_expr = compile_expression("--greeterpos", greeter_x_expr, vars, vars_size);
-    te_expr *te_greeter_y_expr = compile_expression("--greeterpos", greeter_y_expr, vars, vars_size);
+    /* Compile all tinyexpr expressions once on first call; reuse thereafter.
+     * The cached_vars[] array points to file-scope doubles that are updated
+     * below before each te_eval() so the cached trees see current values. */
+    if (!te_exprs_compiled) {
+        const unsigned int vars_size = 14;
+        te_cached_ind_x = compile_expression("--indpos", ind_x_expr, te_cached_vars, vars_size);
+        te_cached_ind_y = compile_expression("--indpos", ind_y_expr, te_cached_vars, vars_size);
+        te_cached_time_x = compile_expression("--timepos", time_x_expr, te_cached_vars, vars_size);
+        te_cached_time_y = compile_expression("--timepos", time_y_expr, te_cached_vars, vars_size);
+        te_cached_date_x = compile_expression("--datepos", date_x_expr, te_cached_vars, vars_size);
+        te_cached_date_y = compile_expression("--datepos", date_y_expr, te_cached_vars, vars_size);
+        te_cached_layout_x = compile_expression("--layoutpos", layout_x_expr, te_cached_vars, vars_size);
+        te_cached_layout_y = compile_expression("--layoutpos", layout_y_expr, te_cached_vars, vars_size);
+        te_cached_status_x = compile_expression("--statuspos", status_x_expr, te_cached_vars, vars_size);
+        te_cached_status_y = compile_expression("--statuspos", status_y_expr, te_cached_vars, vars_size);
+        te_cached_verif_x = compile_expression("--verifpos", verif_x_expr, te_cached_vars, vars_size);
+        te_cached_verif_y = compile_expression("--verifpos", verif_y_expr, te_cached_vars, vars_size);
+        te_cached_wrong_x = compile_expression("--wrongpos", wrong_x_expr, te_cached_vars, vars_size);
+        te_cached_wrong_y = compile_expression("--wrongpos", wrong_y_expr, te_cached_vars, vars_size);
+        te_cached_modif_x = compile_expression("--modifpos", modif_x_expr, te_cached_vars, vars_size);
+        te_cached_modif_y = compile_expression("--modifpos", modif_y_expr, te_cached_vars, vars_size);
+        te_cached_bar_x = compile_expression("--bar-position", bar_x_expr, te_cached_vars, vars_size);
+        te_cached_bar_y = strlen(bar_y_expr) ? compile_expression("--bar-position", bar_y_expr, te_cached_vars, vars_size) : NULL;
+        te_cached_bar_width = strlen(bar_width_expr) ? compile_expression("--bar-width", bar_width_expr, te_cached_vars, vars_size) : NULL;
+        te_cached_greeter_x = compile_expression("--greeterpos", greeter_x_expr, te_cached_vars, vars_size);
+        te_cached_greeter_y = compile_expression("--greeterpos", greeter_y_expr, te_cached_vars, vars_size);
+        te_exprs_compiled = true;
+    }
 
     if (xr_screens > 0) {
         if (screen_number < 0 || screen_number > xr_screens) {
@@ -1048,42 +1203,54 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
             screen_y = xr_resolutions[current_screen].y / scaling_factor;
             draw_data.screen_x = screen_x;
             draw_data.screen_y = screen_y;
-            draw_data.indicator_x = te_eval(te_ind_x_expr);
-            draw_data.indicator_y = te_eval(te_ind_y_expr);
-            draw_data.time_text.x = te_eval(te_time_x_expr);
-            draw_data.time_text.y = te_eval(te_time_y_expr);
-            draw_data.date_text.x = te_eval(te_date_x_expr);
-            draw_data.date_text.y = te_eval(te_date_y_expr);
-            draw_data.keylayout_text.x = te_eval(te_layout_x_expr);
-            draw_data.keylayout_text.y = te_eval(te_layout_y_expr);
-            draw_data.greeter_text.x = te_eval(te_greeter_x_expr);
-            draw_data.greeter_text.y = te_eval(te_greeter_y_expr);
+            /* Sync per-screen geometry into the cached te_variable doubles */
+            te_var_w = width;
+            te_var_h = height;
+            te_var_x = screen_x;
+            te_var_y = screen_y;
+            te_var_r = radius;
+            draw_data.indicator_x = te_eval(te_cached_ind_x);
+            draw_data.indicator_y = te_eval(te_cached_ind_y);
+            te_var_ix = draw_data.indicator_x;
+            te_var_iy = draw_data.indicator_y;
+            draw_data.time_text.x = te_eval(te_cached_time_x);
+            draw_data.time_text.y = te_eval(te_cached_time_y);
+            te_var_tx = draw_data.time_text.x;
+            te_var_ty = draw_data.time_text.y;
+            draw_data.date_text.x = te_eval(te_cached_date_x);
+            draw_data.date_text.y = te_eval(te_cached_date_y);
+            te_var_dx = draw_data.date_text.x;
+            te_var_dy = draw_data.date_text.y;
+            draw_data.keylayout_text.x = te_eval(te_cached_layout_x);
+            draw_data.keylayout_text.y = te_eval(te_cached_layout_y);
+            draw_data.greeter_text.x = te_eval(te_cached_greeter_x);
+            draw_data.greeter_text.y = te_eval(te_cached_greeter_y);
 
             switch (auth_state) {
                 case STATE_AUTH_VERIFY:
                 case STATE_AUTH_LOCK:
-                    draw_data.status_text.x = te_eval(te_verif_x_expr);
-                    draw_data.status_text.y = te_eval(te_verif_y_expr);
+                    draw_data.status_text.x = te_eval(te_cached_verif_x);
+                    draw_data.status_text.y = te_eval(te_cached_verif_y);
                     break;
                 case STATE_AUTH_WRONG:
                 case STATE_I3LOCK_LOCK_FAILED:
-                    draw_data.status_text.x = te_eval(te_wrong_x_expr);
-                    draw_data.status_text.y = te_eval(te_wrong_y_expr);
+                    draw_data.status_text.x = te_eval(te_cached_wrong_x);
+                    draw_data.status_text.y = te_eval(te_cached_wrong_y);
                     break;
                 default:
-                    draw_data.status_text.x = te_eval(te_status_x_expr);
-                    draw_data.status_text.y = te_eval(te_status_y_expr);
+                    draw_data.status_text.x = te_eval(te_cached_status_x);
+                    draw_data.status_text.y = te_eval(te_cached_status_y);
                     break;
             }
 
-            draw_data.mod_text.x = te_eval(te_modif_x_expr);
-            draw_data.mod_text.y = te_eval(te_modif_y_expr);
+            draw_data.mod_text.x = te_eval(te_cached_modif_x);
+            draw_data.mod_text.y = te_eval(te_cached_modif_y);
 
-            if (te_bar_y_expr) {
-                draw_data.bar_x = te_eval(te_bar_x_expr);
-                draw_data.bar_y = te_eval(te_bar_y_expr);
+            if (te_cached_bar_y) {
+                draw_data.bar_x = te_eval(te_cached_bar_x);
+                draw_data.bar_y = te_eval(te_cached_bar_y);
             } else {
-                double bar_offset = te_eval(te_bar_x_expr);
+                double bar_offset = te_eval(te_cached_bar_x);
                 if (bar_orientation == BAR_VERT) {
                     draw_data.bar_x = bar_offset;
                     draw_data.bar_y = screen_y;
@@ -1092,13 +1259,17 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
                     draw_data.bar_y = bar_offset;
                 }
             }
-            if (te_bar_width_expr)
-                draw_data.bar_width = te_eval(te_bar_width_expr);
+            if (te_cached_bar_width)
+                draw_data.bar_width = te_eval(te_cached_bar_width);
             else if (bar_orientation == BAR_VERT)
                 draw_data.bar_width = height;
             else
                 draw_data.bar_width = width;
 
+
+            te_var_bx = draw_data.bar_x;
+            te_var_by = draw_data.bar_y;
+            te_var_bw = draw_data.bar_width;
 
             DEBUG("Indicator at %fx%f on screen %d\n", draw_data.indicator_x, draw_data.indicator_y, current_screen + 1);
             DEBUG("Bar at %fx%f with width %f on screen %d\n", draw_data.bar_x, draw_data.bar_y, draw_data.bar_width, current_screen + 1);
@@ -1108,6 +1279,49 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
             DEBUG("Status at %fx%f on screen %d\n", draw_data.status_text.x, draw_data.status_text.y, current_screen + 1);
             DEBUG("Mod at %fx%f on screen %d\n", draw_data.mod_text.x, draw_data.mod_text.y, current_screen + 1);
             // scale_draw_data(&draw_data, scaling_factor);
+
+            last_ind_x = draw_data.indicator_x;
+            last_ind_y = draw_data.indicator_y;
+
+            /* Frosted-glass blur behind indicator (multi-monitor) */
+            if (ind_blur_radius > 0 && bg_cache != NULL) {
+                double blur_r = (circle_radius + (double)ind_blur_radius) * scaling_factor;
+                double cx = draw_data.indicator_x * scaling_factor;
+                double cy = draw_data.indicator_y * scaling_factor;
+
+                int src_x = (int)(cx - blur_r);
+                int src_y = (int)(cy - blur_r);
+                int src_size = (int)(2.0 * blur_r);
+                int cache_w = cairo_image_surface_get_width(bg_cache);
+                int cache_h = cairo_image_surface_get_height(bg_cache);
+
+                if (src_x < 0) src_x = 0;
+                if (src_y < 0) src_y = 0;
+                if (src_x + src_size > cache_w) src_size = cache_w - src_x;
+                if (src_y + src_size > cache_h) src_size = cache_h - src_y;
+
+                if (src_size > 0) {
+                    cairo_surface_t *tmp_surf = cairo_image_surface_create(
+                        CAIRO_FORMAT_ARGB32, src_size, src_size);
+                    cairo_t *tmp_cr = cairo_create(tmp_surf);
+                    cairo_set_source_surface(tmp_cr, bg_cache, -src_x, -src_y);
+                    cairo_paint(tmp_cr);
+                    cairo_destroy(tmp_cr);
+
+                    blur_image_surface(tmp_surf, ind_blur_radius, 1);
+
+                    cairo_save(ctx);
+                    cairo_identity_matrix(ctx);
+                    cairo_arc(ctx, cx, cy, blur_r, 0, 2 * M_PI);
+                    cairo_clip(ctx);
+                    cairo_set_source_surface(ctx, tmp_surf, src_x, src_y);
+                    cairo_paint(ctx);
+                    cairo_restore(ctx);
+
+                    cairo_surface_destroy(tmp_surf);
+                }
+            }
+
             draw_elements(ctx, &draw_data);
         }
     } else {
@@ -1121,38 +1335,51 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         draw_data.indicator_x = width / 2;
         draw_data.indicator_y = height / 2;
 
-        draw_data.time_text.x = te_eval(te_time_x_expr);
-        draw_data.time_text.y = te_eval(te_time_y_expr);
-        draw_data.date_text.x = te_eval(te_date_x_expr);
-        draw_data.date_text.y = te_eval(te_date_y_expr);
-        draw_data.keylayout_text.x = te_eval(te_layout_x_expr);
-        draw_data.keylayout_text.y = te_eval(te_layout_y_expr);
-        draw_data.greeter_text.x = te_eval(te_greeter_x_expr);
-        draw_data.greeter_text.y = te_eval(te_greeter_y_expr);
+        /* Sync fallback geometry into cached te_variable doubles */
+        te_var_w = width;
+        te_var_h = height;
+        te_var_x = 0;
+        te_var_y = 0;
+        te_var_r = radius;
+        te_var_ix = draw_data.indicator_x;
+        te_var_iy = draw_data.indicator_y;
+
+        draw_data.time_text.x = te_eval(te_cached_time_x);
+        draw_data.time_text.y = te_eval(te_cached_time_y);
+        te_var_tx = draw_data.time_text.x;
+        te_var_ty = draw_data.time_text.y;
+        draw_data.date_text.x = te_eval(te_cached_date_x);
+        draw_data.date_text.y = te_eval(te_cached_date_y);
+        te_var_dx = draw_data.date_text.x;
+        te_var_dy = draw_data.date_text.y;
+        draw_data.keylayout_text.x = te_eval(te_cached_layout_x);
+        draw_data.keylayout_text.y = te_eval(te_cached_layout_y);
+        draw_data.greeter_text.x = te_eval(te_cached_greeter_x);
+        draw_data.greeter_text.y = te_eval(te_cached_greeter_y);
         switch (auth_state) {
             case STATE_AUTH_VERIFY:
             case STATE_AUTH_LOCK:
-                draw_data.status_text.x = te_eval(te_verif_x_expr);
-                draw_data.status_text.y = te_eval(te_verif_y_expr);
+                draw_data.status_text.x = te_eval(te_cached_verif_x);
+                draw_data.status_text.y = te_eval(te_cached_verif_y);
                 break;
             case STATE_AUTH_WRONG:
             case STATE_I3LOCK_LOCK_FAILED:
-                draw_data.status_text.x = te_eval(te_wrong_x_expr);
-                draw_data.status_text.y = te_eval(te_wrong_y_expr);
+                draw_data.status_text.x = te_eval(te_cached_wrong_x);
+                draw_data.status_text.y = te_eval(te_cached_wrong_y);
                 break;
             default:
-                draw_data.status_text.x = te_eval(te_status_x_expr);
-                draw_data.status_text.y = te_eval(te_status_y_expr);
+                draw_data.status_text.x = te_eval(te_cached_status_x);
+                draw_data.status_text.y = te_eval(te_cached_status_y);
                 break;
         }
-        draw_data.mod_text.x = te_eval(te_modif_x_expr);
-        draw_data.mod_text.y = te_eval(te_modif_y_expr);
+        draw_data.mod_text.x = te_eval(te_cached_modif_x);
+        draw_data.mod_text.y = te_eval(te_cached_modif_y);
 
-        if (te_bar_y_expr) {
-            draw_data.bar_x = te_eval(te_bar_x_expr);
-            draw_data.bar_y = te_eval(te_bar_y_expr);
+        if (te_cached_bar_y) {
+            draw_data.bar_x = te_eval(te_cached_bar_x);
+            draw_data.bar_y = te_eval(te_cached_bar_y);
         } else {
-            double bar_offset = te_eval(te_bar_x_expr);
+            double bar_offset = te_eval(te_cached_bar_x);
             if (bar_orientation == BAR_VERT) {
                 draw_data.bar_x = bar_offset;
                 draw_data.bar_y = screen_y;
@@ -1161,12 +1388,16 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
                 draw_data.bar_y = bar_offset;
             }
         }
-        if (te_bar_width_expr)
-            draw_data.bar_width = te_eval(te_bar_width_expr);
+        if (te_cached_bar_width)
+            draw_data.bar_width = te_eval(te_cached_bar_width);
         else if (bar_orientation == BAR_VERT)
             draw_data.bar_width = height;
         else
             draw_data.bar_width = width;
+
+        te_var_bx = draw_data.bar_x;
+        te_var_by = draw_data.bar_y;
+        te_var_bw = draw_data.bar_width;
 
         DEBUG("Indicator at %fx%f\n", draw_data.indicator_x, draw_data.indicator_y);
         DEBUG("Bar at %fx%f with width %f\n", draw_data.bar_x, draw_data.bar_y, draw_data.bar_width);
@@ -1176,38 +1407,74 @@ void render_lock(uint32_t *resolution, xcb_drawable_t drawable) {
         DEBUG("Status at %fx%f\n", draw_data.status_text.x, draw_data.status_text.y);
         DEBUG("Mod at %fx%f\n", draw_data.mod_text.x, draw_data.mod_text.y);
 
+        /* Snapshot background-only state for partial redraws */
+        cairo_surface_flush(xcb_output);
+        if (bg_only_pixmap == XCB_NONE ||
+            bg_only_w != resolution[0] || bg_only_h != resolution[1]) {
+            if (bg_only_pixmap != XCB_NONE)
+                xcb_free_pixmap(conn, bg_only_pixmap);
+            bg_only_pixmap = xcb_generate_id(conn);
+            xcb_create_pixmap(conn, 32, bg_only_pixmap, win, resolution[0], resolution[1]);
+            bg_only_w = resolution[0];
+            bg_only_h = resolution[1];
+            /* Invalidate copy_gc since pixmap changed */
+            if (copy_gc != XCB_NONE) {
+                xcb_free_gc(conn, copy_gc);
+                copy_gc = XCB_NONE;
+            }
+        }
+        xcb_copy_area(conn, drawable, bg_only_pixmap, get_copy_gc(),
+                      0, 0, 0, 0, resolution[0], resolution[1]);
+
+        last_ind_x = draw_data.indicator_x;
+        last_ind_y = draw_data.indicator_y;
+
+        /* Frosted-glass blur behind indicator */
+        if (ind_blur_radius > 0 && bg_cache != NULL) {
+            double blur_r = (circle_radius + (double)ind_blur_radius) * scaling_factor;
+            double cx = draw_data.indicator_x * scaling_factor;
+            double cy = draw_data.indicator_y * scaling_factor;
+
+            int src_x = (int)(cx - blur_r);
+            int src_y = (int)(cy - blur_r);
+            int src_size = (int)(2.0 * blur_r);
+            int cache_w = cairo_image_surface_get_width(bg_cache);
+            int cache_h = cairo_image_surface_get_height(bg_cache);
+
+            if (src_x < 0) src_x = 0;
+            if (src_y < 0) src_y = 0;
+            if (src_x + src_size > cache_w) src_size = cache_w - src_x;
+            if (src_y + src_size > cache_h) src_size = cache_h - src_y;
+
+            if (src_size > 0) {
+                cairo_surface_t *tmp_surf = cairo_image_surface_create(
+                    CAIRO_FORMAT_ARGB32, src_size, src_size);
+                cairo_t *tmp_cr = cairo_create(tmp_surf);
+                cairo_set_source_surface(tmp_cr, bg_cache, -src_x, -src_y);
+                cairo_paint(tmp_cr);
+                cairo_destroy(tmp_cr);
+
+                blur_image_surface(tmp_surf, ind_blur_radius, 1);
+
+                /* Composite blurred region back, clipped to circle */
+                cairo_save(ctx);
+                cairo_identity_matrix(ctx);
+                cairo_arc(ctx, cx, cy, blur_r, 0, 2 * M_PI);
+                cairo_clip(ctx);
+                cairo_set_source_surface(ctx, tmp_surf, src_x, src_y);
+                cairo_paint(ctx);
+                cairo_restore(ctx);
+
+                cairo_surface_destroy(tmp_surf);
+            }
+        }
+
         draw_elements(ctx, &draw_data);
     }
 
-    te_free(te_ind_x_expr);
-    te_free(te_ind_y_expr);
-    te_free(te_time_x_expr);
-    te_free(te_time_y_expr);
-    te_free(te_date_x_expr);
-    te_free(te_date_y_expr);
-    te_free(te_layout_x_expr);
-    te_free(te_layout_y_expr);
-    te_free(te_status_x_expr);
-    te_free(te_status_y_expr);
-    te_free(te_verif_x_expr);
-    te_free(te_verif_y_expr);
-    te_free(te_wrong_x_expr);
-    te_free(te_wrong_y_expr);
-    te_free(te_modif_x_expr);
-    te_free(te_modif_y_expr);
-    te_free(te_bar_x_expr);
-    te_free(te_bar_y_expr);
-    te_free(te_bar_width_expr);
-    te_free(te_greeter_x_expr);
-    te_free(te_greeter_y_expr);
-
-    cairo_set_source_surface(xcb_ctx, output, 0, 0);
-    cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
-    cairo_fill(xcb_ctx);
+    cairo_restore(ctx);  /* undo cairo_scale(ctx, scaling_factor, scaling_factor) */
 
     cairo_surface_destroy(xcb_output);
-    cairo_surface_destroy(output);
-    cairo_destroy(ctx);
     cairo_destroy(xcb_ctx);
 }
 
@@ -1239,8 +1506,8 @@ void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ct
             scale_y = xr_resolutions[i].height / image_height;
 
         } else if (bg_type == MAX || bg_type == FILL) {
-            double aspect_diff = (double) xr_resolutions[i].height / xr_resolutions[i].width - image_height / image_width;
-            if((bg_type == MAX && aspect_diff >= 0) || (bg_type == FILL && aspect_diff <= 0)) {
+            double aspect_diff = (double)xr_resolutions[i].height / xr_resolutions[i].width - image_height / image_width;
+            if ((bg_type == MAX && aspect_diff >= 0) || (bg_type == FILL && aspect_diff <= 0)) {
                 scale_x = scale_y = xr_resolutions[i].width / image_width;
             } else if ((bg_type == MAX && aspect_diff < 0) || (bg_type == FILL && aspect_diff > 0)) {
                 scale_x = scale_y = xr_resolutions[i].height / image_height;
@@ -1272,17 +1539,108 @@ void draw_image(uint32_t* root_resolution, cairo_surface_t *img, cairo_t* xcb_ct
 }
 
 /*
+ * Mutex protecting redraw_screen() from concurrent calls between the main
+ * event loop and the --redraw-thread pthread. Uses PTHREAD_MUTEX_RECURSIVE so
+ * that clear_indicator() → redraw_screen() re-entry from the same thread does
+ * not deadlock.
+ */
+static pthread_mutex_t redraw_mutex;
+static pthread_once_t redraw_mutex_once = PTHREAD_ONCE_INIT;
+
+static void init_redraw_mutex(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&redraw_mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+/*
  * Calls render_lock on a new pixmap and swaps that with the current pixmap
  *
  */
-void redraw_screen(void) {
-    DEBUG("redraw_screen(unlock_state = %d, auth_state = %d) @ [%lu]\n", unlock_state, auth_state, (unsigned long)time(NULL));
-    xcb_pixmap_t pixmap = create_bg_pixmap(conn, win, last_resolution, color);
-    render_lock(last_resolution, pixmap);
-    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[1]){pixmap});
-    xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
-    xcb_free_pixmap(conn, pixmap);
+
+static xcb_gcontext_t get_copy_gc(void) {
+    if (copy_gc == XCB_NONE && persistent_pixmap != XCB_NONE) {
+        copy_gc = xcb_generate_id(conn);
+        xcb_create_gc(conn, copy_gc, persistent_pixmap, 0, NULL);
+    }
+    return copy_gc;
+}
+
+static void partial_redraw_indicator(void) {
+    if (bg_only_pixmap == XCB_NONE || persistent_pixmap == XCB_NONE)
+        return;
+
+    const double scaling_factor = get_dpi_value() / 96.0;
+    int px = (int)(last_ind_x * scaling_factor);
+    int py = (int)(last_ind_y * scaling_factor);
+    int radius = (int)((circle_radius + ring_width / 2.0 + 10.0) * scaling_factor);
+
+    int x0 = px - radius; if (x0 < 0) x0 = 0;
+    int y0 = py - radius; if (y0 < 0) y0 = 0;
+    int x1 = px + radius; if (x1 > (int)last_resolution[0]) x1 = (int)last_resolution[0];
+    int y1 = py + radius; if (y1 > (int)last_resolution[1]) y1 = (int)last_resolution[1];
+    int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0) return;
+
+    /* Restore background region */
+    xcb_copy_area(conn, bg_only_pixmap, persistent_pixmap, get_copy_gc(),
+                  x0, y0, x0, y0, w, h);
+
+    /* Redraw indicator on top */
+    xcb_visualtype_t *vt = get_visualtype_by_depth(32, screen);
+    cairo_surface_t *surf = cairo_xcb_surface_create(
+        conn, persistent_pixmap, vt, last_resolution[0], last_resolution[1]);
+    cairo_t *cr = cairo_create(surf);
+    cairo_scale(cr, scaling_factor, scaling_factor);
+    draw_indic(cr, last_ind_x, last_ind_y);
+    /* Flush all Cairo commands to the X server before presenting,
+     * so xcb_clear_area never sees a partially-drawn indicator. */
+    cairo_surface_flush(surf);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+
+    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP,
+                                 (uint32_t[1]){persistent_pixmap});
+    xcb_clear_area(conn, 0, win, x0, y0, w, h);
     xcb_flush(conn);
+}
+
+void redraw_screen(void) {
+    pthread_once(&redraw_mutex_once, init_redraw_mutex);
+    pthread_mutex_lock(&redraw_mutex);
+    DEBUG("redraw_screen(unlock_state = %d, auth_state = %d) @ [%lu]\n", unlock_state, auth_state, (unsigned long)time(NULL));
+
+    /* Reuse server-side pixmap across frames (saves alloc/free per keypress) */
+    if (persistent_pixmap == XCB_NONE ||
+        persistent_pix_w != last_resolution[0] ||
+        persistent_pix_h != last_resolution[1]) {
+        if (persistent_pixmap != XCB_NONE)
+            xcb_free_pixmap(conn, persistent_pixmap);
+        persistent_pixmap = create_bg_pixmap(conn, win, last_resolution, color);
+        persistent_pix_w = last_resolution[0];
+        persistent_pix_h = last_resolution[1];
+        pending_redraw_mode = REDRAW_FULL;
+        if (bg_only_pixmap != XCB_NONE) {
+            xcb_free_pixmap(conn, bg_only_pixmap);
+            bg_only_pixmap = XCB_NONE;
+        }
+    }
+
+    if (pending_redraw_mode == REDRAW_PARTIAL && bg_only_pixmap != XCB_NONE) {
+        partial_redraw_indicator();
+        pending_redraw_mode = REDRAW_FULL;
+        pthread_mutex_unlock(&redraw_mutex);
+        return;
+    }
+
+    render_lock(last_resolution, persistent_pixmap);
+    xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[1]){persistent_pixmap});
+    xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
+    xcb_flush(conn);
+    pending_redraw_mode = REDRAW_FULL;
+    pthread_mutex_unlock(&redraw_mutex);
 }
 
 /*
@@ -1308,7 +1666,14 @@ void *start_time_redraw_tick_pthread(void *arg) {
 }
 
 static void time_redraw_cb(struct ev_loop *loop, ev_periodic *w, int revents) {
-    redraw_screen();
+    if (redraw_thread) {
+        pthread_mutex_lock(&render_cond_mutex);
+        render_pending = true;
+        pthread_cond_signal(&render_cond);
+        pthread_mutex_unlock(&render_cond_mutex);
+    } else {
+        redraw_screen();
+    }
 }
 
 void start_time_redraw_tick(struct ev_loop *main_loop) {

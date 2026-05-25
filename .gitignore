@@ -1,4 +1,5 @@
 i3lock
+LOCAL-AGENTS.md
 *.o
 tags
 *.swp
@@ -33,3 +34,4 @@ Makefile.in
 /missing
 /stamp-h1
 aminclude_static.am
+pam/i3lock

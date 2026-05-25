@@ -1,0 +1,49 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - '*-albertoos.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install base tools
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git base-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          pacman -S --noconfirm \
+            xcb-util-image \
+            xcb-util \
+            xcb-util-xrm \
+            libxcb \
+            pam \
+            libev \
+            cairo \
+            fontconfig \
+            libxkbcommon-x11 \
+            libjpeg-turbo \
+            giflib \
+            pkgconf \
+            autoconf \
+            automake
+
+      - name: Build
+        run: bash build.sh
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/i3lock
+          fail_on_unmatched_files: true

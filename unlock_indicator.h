@@ -47,6 +47,11 @@ typedef enum {
     MAX,
 } background_type_t;
 
+typedef enum {
+    REDRAW_FULL = 0,
+    REDRAW_PARTIAL = 1,
+} redraw_mode_t;
+
 
 typedef enum {
     CC_POS_RESET,
@@ -71,4 +76,5 @@ void clear_indicator(void);
 void start_time_redraw_timeout(void);
 void* start_time_redraw_tick_pthread(void* arg);
 void start_time_redraw_tick(struct ev_loop* main_loop);
+void invalidate_bg_cache(void);
 #endif
